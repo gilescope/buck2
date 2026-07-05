@@ -79,6 +79,30 @@ impl ServerCommandTemplate for HydrationServerCommand {
                 // queue, so the page-out evictions are processed before we purge.
                 let _ = self.dice.metrics();
                 memory::purge_jemalloc()?;
+                // Cross-restart persistence: page-out doubles as the snapshot
+                // save point when a snapshot path is configured. The next
+                // daemon (same env) loads it at construction.
+                if let Some((meta_path, digest)) =
+                    buck2_build_api::configure_dice::dice_snapshot_env_config()
+                {
+                    let stats = self
+                        .dice
+                        .save_persisted_snapshot(&meta_path, digest)
+                        .await
+                        .map_err(|e| {
+                            buck2_error::conversion::from_any_with_tag(
+                                e,
+                                buck2_error::ErrorTag::Environment,
+                            )
+                        })?;
+                    tracing::info!(
+                        "dice snapshot saved: {} nodes, {} injected, {} key-only, {} dropped",
+                        stats.nodes_persisted,
+                        stats.nodes_injected,
+                        stats.keys_only,
+                        stats.dropped_unserializable,
+                    );
+                }
                 Ok(buck2_cli_proto::HydrationResponse::default())
             }
             HydrationSubcommand::PageIn => {

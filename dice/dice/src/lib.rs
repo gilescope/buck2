@@ -200,6 +200,7 @@ mod impls;
 pub mod introspection;
 pub(crate) mod metrics;
 pub(crate) mod persist;
+pub use crate::persist::PersistStats;
 pub(crate) mod stats;
 mod transaction;
 mod transaction_update;

@@ -29,6 +29,28 @@ use crate::actions::execute::dice_data::SetInvalidationTrackingConfig;
 use crate::build::detailed_aggregated_metrics::dice::SetDetailedAggregatedMetricsHandle;
 use crate::build::detailed_aggregated_metrics::events::DetailedAggregatedMetricsHandle;
 
+/// Cross-restart persistence knobs, shared by the load site (here) and the
+/// save site (`buck2 debug hydration page-out`). Returns the snapshot
+/// metadata path plus the inputs digest that gates reuse: blake3 of the
+/// buck2 revision and the optional `BUCK2_DICE_SNAPSHOT_SEED` (CI sets the
+/// seed to a hash of everything else it considers identity-defining, e.g.
+/// toolchain pins and buckconfig).
+pub fn dice_snapshot_env_config() -> Option<(std::path::PathBuf, [u8; 32])> {
+    let path = std::env::var("BUCK2_DICE_SNAPSHOT_PATH").ok()?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(buck2_build_info::revision().unwrap_or("dev").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(
+        std::env::var("BUCK2_DICE_SNAPSHOT_SEED")
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    Some((
+        std::path::PathBuf::from(path),
+        *hasher.finalize().as_bytes(),
+    ))
+}
+
 /// Utility to configure the dice globals.
 /// One place to not forget to initialize something in all places.
 pub async fn configure_dice_for_buck(
@@ -82,10 +104,41 @@ pub async fn configure_dice_for_buck(
     }
 
     let dice = dice.build(detect_cycles);
-    let mut dice_ctx = dice.updater();
-    dice_ctx.set_none_cell_resolver()?;
-    dice_ctx.set_none_legacy_config_external_data()?;
-    dice_ctx.commit().await;
+
+    // Opt-in cross-restart persistence: with both `BUCK2_DICE_DB_PATH` and
+    // `BUCK2_DICE_SNAPSHOT_PATH` set, a graph snapshot saved by
+    // `buck2 debug hydration page-out` is loaded into the fresh daemon.
+    // Header mismatch or a missing file is a silent cold start.
+    let loaded = match dice_snapshot_env_config() {
+        Some((meta_path, digest)) => dice
+            .load_persisted_snapshot(&meta_path, digest)
+            .await
+            .map_err(|e| {
+                buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Environment)
+            })?,
+        None => None,
+    };
+    match loaded {
+        Some(stats) => {
+            // The none-seeding below is skipped: the injected keys exist with
+            // their persisted values, and the first command's changed_to
+            // calls diff live reality against that baseline. Seeding None in
+            // between would spuriously dirty every cell-dependent node.
+            tracing::info!(
+                "dice snapshot loaded: {} nodes, {} injected, {} key-only, {} dropped",
+                stats.nodes_persisted,
+                stats.nodes_injected,
+                stats.keys_only,
+                stats.dropped_unserializable + stats.dropped_dangling_dep,
+            );
+        }
+        None => {
+            let mut dice_ctx = dice.updater();
+            dice_ctx.set_none_cell_resolver()?;
+            dice_ctx.set_none_legacy_config_external_data()?;
+            dice_ctx.commit().await;
+        }
+    }
 
     Ok(dice)
 }
