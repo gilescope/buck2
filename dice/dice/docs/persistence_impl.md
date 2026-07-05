@@ -1,7 +1,39 @@
 # DICE persistence: implementation plan
 
 Complements `persistence_plan.md` (read that first for motivation and staged plan).
-Status: pre-implementation design. All file:line refs against `gilescope/buck2`.
+Status: **S1-S3 implemented** on this branch (see `dice/dice/src/persist.rs` and
+`impls/tests/persist.rs`); this doc now records the as-built decisions where they
+diverged from the pre-implementation design below.
+
+## As-built summary (2026-07-05)
+
+- Values ride Meta's existing page-out path (`DiceStorage`, content-addressed
+  `DataKey` blobs in sqlite); the persist module adds the graph skeleton: keys
+  via the `pagable_typetag` registry, deps as record ordinals, VersionRanges +
+  ForceDirtyHistory via bincode metadata (`dice-graph.meta`), canonically
+  sorted for byte-stable output (save/load/save is byte-identical, tested).
+- Load rebuilds nodes paged-out (values hydrate lazily on demand), reinstalls
+  injected leaves hydrated as the diff baseline, re-derives rdep edges (they
+  are load-bearing for invalidation), and fast-forwards the version counter.
+  The daemon's normal per-command changed_to calls ARE the frontier diff; on a
+  successful load the set_none_* seeding is skipped so no spurious None
+  interlude dirties the graph.
+- Wiring: load at Dice construction (BUCK2_DICE_DB_PATH +
+  BUCK2_DICE_SNAPSHOT_PATH); save via `buck2 debug hydration page-out`.
+  Reuse gate: blake3(buck2 revision, BUCK2_DICE_SNAPSHOT_SEED).
+- Projections persist as (typetag blob, base ordinal) records sorted after all
+  plain keys - single forward resolution pass at load.
+- EvalImportKey values serialize but panic on hydrate (NativeFunc skipped
+  slots), so BUCK2_DICE_SNAPSHOT_DENY (default "EvalImportKey") persists such
+  types key-only. Injected leaves that cannot round-trip are dropped whole.
+- S3 dodge as-built: `AnalysisValueSerialize` strips the frozen heap
+  (`actions_only_for_persist`) when snapshot mode is active. All provider/tset
+  accessors already return Result - a provider read on a persisted-clean node
+  is a clean "missing analysis storage" error, never a panic. Builds that only
+  need actions (the code-change CI case) never read providers.
+- ConfigurationHash/SipHash: unchanged. Within one binary the hash is
+  consistent, and cross-binary reuse is gated off by the header, so the Blake3
+  rehash matters only for S4-style standalone cache keys - deferred with S4.
 
 ---
 

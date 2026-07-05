@@ -680,6 +680,19 @@ pub struct RecordedAnalysisValues {
 starlark::register_starlark_any_complex!(AnalysisValueStorage<'_>, frozen FrozenAnalysisValueStorage);
 
 impl RecordedAnalysisValues {
+    /// The persistence dodge: same analysis minus the frozen starlark heap.
+    /// Action lookups keep working; provider/tset accessors return their
+    /// existing "missing analysis storage" error. Dependent analyses that
+    /// genuinely need providers of a persisted-clean node surface that error
+    /// rather than recomputing - the snapshot deny knob is the escape hatch.
+    pub fn actions_only_for_persist(&self) -> Self {
+        Self {
+            self_key: self.self_key.dupe(),
+            analysis_storage: None,
+            actions: self.actions.clone_for_persist(),
+        }
+    }
+
     /// Creates a minimal RecordedAnalysisValues for testing action lookups only.
     /// This version doesn't require DYNAMIC_LAMBDA_PARAMS_STORAGES to be initialized.
     pub fn testing_new_actions_only(self_key: DeferredHolderKey, actions: RecordedActions) -> Self {

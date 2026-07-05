@@ -73,6 +73,20 @@ impl AnalysisResult {
         self.analysis_values.provider_collection()
     }
 
+    /// Persist support: the action graph without the provider heap (the S3
+    /// "analysis dodge" - see dice/dice/docs/persistence_plan.md). Validations
+    /// and profile data ride the heap's fate.
+    pub fn actions_only_for_persist(&self) -> Self {
+        Self {
+            analysis_values: Arc::new(self.analysis_values.actions_only_for_persist()),
+            profile_data: None,
+            promise_artifact_map: self.promise_artifact_map.dupe(),
+            num_declared_actions: self.num_declared_actions,
+            num_declared_artifacts: self.num_declared_artifacts,
+            validations: None,
+        }
+    }
+
     pub fn promise_artifact_map(&self) -> &Arc<StdBuckHashMap<PromiseArtifactId, Artifact>> {
         &self.promise_artifact_map
     }
@@ -87,5 +101,40 @@ impl AnalysisResult {
 
     pub fn analysis_values(&self) -> &RecordedAnalysisValues {
         &self.analysis_values
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_core::deferred::key::DeferredHolderKey;
+    use pagable::PagableDeserialize;
+    use pagable::PagableSerialize;
+    use pagable::testing::TestingDeserializer;
+    use pagable::testing::TestingSerializer;
+
+    use super::*;
+    use crate::actions::registry::RecordedActions;
+    use crate::analysis::registry::RecordedAnalysisValues;
+
+    /// The S3 dodge's wire form: an actions-only AnalysisResult must
+    /// round-trip through pagable, keep its counts, and answer provider
+    /// reads with the standard missing-storage error, not a panic.
+    #[test]
+    fn actions_only_analysis_round_trips() -> pagable::Result<()> {
+        let key = DeferredHolderKey::testing_new("cell//pkg:target");
+        let values = RecordedAnalysisValues::testing_new_actions_only(key, RecordedActions::new(0));
+        let res = AnalysisResult::new(values, None, Default::default(), 3, 4, None);
+        let stripped = res.actions_only_for_persist();
+
+        let mut ser = TestingSerializer::new();
+        stripped.pagable_serialize(&mut ser)?;
+        let bytes = ser.finish();
+        let mut de = TestingDeserializer::new(&bytes);
+        let restored = AnalysisResult::pagable_deserialize(&mut de)?;
+
+        assert_eq!(restored.num_declared_actions, 3);
+        assert_eq!(restored.num_declared_artifacts, 4);
+        assert!(restored.providers().is_err(), "storage-less: clean error");
+        Ok(())
     }
 }

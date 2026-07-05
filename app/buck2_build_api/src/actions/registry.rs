@@ -336,6 +336,13 @@ pub struct RecordedActions {
 }
 
 impl RecordedActions {
+    /// Persist support: a cheap structural copy (ActionLookup is Arc-backed).
+    pub(crate) fn clone_for_persist(&self) -> Self {
+        Self {
+            actions: self.actions.clone(),
+        }
+    }
+
     pub fn new(capacity: usize) -> Self {
         Self {
             actions: Vec::with_capacity(capacity),
