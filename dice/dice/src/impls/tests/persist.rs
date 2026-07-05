@@ -34,6 +34,8 @@ use crate::api::key::Key;
 use crate::api::key::NoValueSerialize;
 use crate::api::key::PagableValueSerialize;
 use crate::api::key::ValueSerialize;
+use crate::api::projection::DiceProjectionComputations;
+use crate::api::projection::ProjectionKey;
 use crate::api::user_data::UserComputationData;
 use crate::impls::dice::Dice;
 
@@ -126,6 +128,61 @@ impl Key for Opaque {
     }
 }
 
+/// Projection over `Derived`: extracts the low digit. Exercises the
+/// PersistedKey::Projection record path.
+#[derive(Allocative, Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Pagable)]
+#[pagable_typetag(crate::DiceProjectionDyn)]
+struct LowDigit;
+
+impl ProjectionKey for LowDigit {
+    type DeriveFromKey = Derived;
+    type Value = u64;
+
+    fn compute(&self, derive_from: &u64, _ctx: &DiceProjectionComputations) -> Self::Value {
+        derive_from % 10
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        PagableValueSerialize::<Self::Value>::new()
+    }
+}
+
+/// A key that consumes the projection, so a projection node lands in the
+/// graph with a dependent above it.
+#[derive(Allocative, Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Pagable)]
+#[pagable_typetag(DiceKeyDyn)]
+struct UsesProjection(u32);
+
+#[async_trait]
+impl Key for UsesProjection {
+    type Value = u64;
+
+    async fn compute(
+        &self,
+        ctx: &mut DiceComputations,
+        _cancellations: &CancellationContext,
+    ) -> Self::Value {
+        if let Ok(c) = ctx.per_transaction_data().data.get::<ComputeCounter>() {
+            c.0.fetch_add(1, Ordering::SeqCst);
+        }
+        let opaque = ctx.compute_opaque(&Derived(self.0)).await.unwrap();
+        let digit = ctx.projection(&opaque, &LowDigit).unwrap();
+        digit + 200
+    }
+
+    fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+        x == y
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        PagableValueSerialize::<Self::Value>::new()
+    }
+}
+
 fn make_dice(path: &std::path::Path) -> anyhow::Result<Arc<Dice>> {
     let storage = DiceStorage::open(path)?;
     let mut builder = Dice::builder();
@@ -158,7 +215,9 @@ async fn warm_start_reuses_clean_graph() -> anyhow::Result<()> {
         assert_eq!(counter1.count(), 1);
         drop(tx);
         dice.wait_for_idle().await;
-        let stats = dice.save_persisted_snapshot(&meta, DIGEST).await?;
+        let stats = dice
+            .save_persisted_snapshot(&meta, DIGEST, &Default::default())
+            .await?;
         assert_eq!(stats.nodes_persisted, 1, "Derived(1)");
         assert_eq!(stats.nodes_injected, 1, "Leaf(1)");
     }
@@ -201,7 +260,8 @@ async fn changed_leaf_dirties_only_its_dependents() -> anyhow::Result<()> {
         assert_eq!(counter1.count(), 2);
         drop(tx);
         dice.wait_for_idle().await;
-        dice.save_persisted_snapshot(&meta, DIGEST).await?;
+        dice.save_persisted_snapshot(&meta, DIGEST, &Default::default())
+            .await?;
     }
 
     let counter2 = ComputeCounter::new();
@@ -242,7 +302,8 @@ async fn save_load_save_is_byte_identical() -> anyhow::Result<()> {
         let _ = tx.compute(&Derived(2)).await?;
         drop(tx);
         dice.wait_for_idle().await;
-        dice.save_persisted_snapshot(&meta_a, DIGEST).await?;
+        dice.save_persisted_snapshot(&meta_a, DIGEST, &Default::default())
+            .await?;
     }
 
     let dice = make_dice(tmp.path())?;
@@ -250,7 +311,8 @@ async fn save_load_save_is_byte_identical() -> anyhow::Result<()> {
         .await?
         .expect("snapshot should load");
     dice.wait_for_idle().await;
-    dice.save_persisted_snapshot(&meta_b, DIGEST).await?;
+    dice.save_persisted_snapshot(&meta_b, DIGEST, &Default::default())
+        .await?;
 
     assert_eq!(
         std::fs::read(&meta_a)?,
@@ -274,7 +336,8 @@ async fn header_mismatch_is_a_cold_start() -> anyhow::Result<()> {
         let _ = tx.compute(&Derived(1)).await?;
         drop(tx);
         dice.wait_for_idle().await;
-        dice.save_persisted_snapshot(&meta, DIGEST).await?;
+        dice.save_persisted_snapshot(&meta, DIGEST, &Default::default())
+            .await?;
     }
 
     let dice = make_dice(tmp.path())?;
@@ -307,7 +370,9 @@ async fn unserializable_value_degrades_to_recompute() -> anyhow::Result<()> {
         assert_eq!(tx.compute(&Derived(1)).await?, 50);
         drop(tx);
         dice.wait_for_idle().await;
-        let stats = dice.save_persisted_snapshot(&meta, DIGEST).await?;
+        let stats = dice
+            .save_persisted_snapshot(&meta, DIGEST, &Default::default())
+            .await?;
         assert_eq!(stats.keys_only, 1, "Opaque(1) persists key-only");
         assert_eq!(stats.nodes_persisted, 1, "Derived(1)");
     }
@@ -324,5 +389,90 @@ async fn unserializable_value_degrades_to_recompute() -> anyhow::Result<()> {
     assert_eq!(tx.compute(&Opaque(1)).await?, 6, "recomputes correctly");
     assert_eq!(tx.compute(&Derived(1)).await?, 50, "still cached");
     assert_eq!(counter2.count(), 1, "only the opaque node recomputed");
+    Ok(())
+}
+
+/// Projection nodes and their dependents survive a save/load cycle.
+#[tokio::test]
+async fn projections_persist_and_reuse() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let meta = tmp.path().join("dice-graph.meta");
+
+    let counter1 = ComputeCounter::new();
+    {
+        let dice = make_dice(tmp.path())?;
+        let mut updater = dice.updater_with_data(user_data_with_counter(&counter1));
+        updater.changed_to(vec![(Leaf(1), 5u64)])?;
+        let mut tx = updater.commit().await;
+        assert_eq!(tx.compute(&UsesProjection(1)).await?, 200); // 50 % 10 = 0
+        drop(tx);
+        dice.wait_for_idle().await;
+        let stats = dice
+            .save_persisted_snapshot(&meta, DIGEST, &Default::default())
+            .await?;
+        assert!(
+            stats.nodes_persisted >= 3,
+            "Derived, LowDigit, UsesProjection"
+        );
+    }
+
+    let counter2 = ComputeCounter::new();
+    let dice = make_dice(tmp.path())?;
+    dice.load_persisted_snapshot(&meta, DIGEST)
+        .await?
+        .expect("snapshot should load");
+
+    let mut updater = dice.updater_with_data(user_data_with_counter(&counter2));
+    updater.changed_to(vec![(Leaf(1), 5u64)])?;
+    let mut tx = updater.commit().await;
+    assert_eq!(tx.compute(&UsesProjection(1)).await?, 200);
+    assert_eq!(
+        counter2.count(),
+        0,
+        "projection chain reused across restart"
+    );
+    Ok(())
+}
+
+/// Denylisted key types persist key-only and recompute after load.
+#[tokio::test]
+async fn denylisted_key_type_degrades_to_recompute() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let meta = tmp.path().join("dice-graph.meta");
+
+    {
+        let dice = make_dice(tmp.path())?;
+        let mut updater = dice.updater();
+        updater.changed_to(vec![(Leaf(1), 5u64)])?;
+        let mut tx = updater.commit().await;
+        let _ = tx.compute(&Derived(1)).await?;
+        drop(tx);
+        dice.wait_for_idle().await;
+        let deny: std::collections::HashSet<String> = [std::any::type_name::<Derived>().to_owned()]
+            .into_iter()
+            .collect();
+        // key_type_name is the short name; fall back to matching either.
+        let deny_short: std::collections::HashSet<String> = deny
+            .iter()
+            .map(|s| s.rsplit("::").next().unwrap().to_owned())
+            .chain(deny.iter().cloned())
+            .collect();
+        let stats = dice
+            .save_persisted_snapshot(&meta, DIGEST, &deny_short)
+            .await?;
+        assert_eq!(stats.keys_only, 1, "Derived(1) is denylisted");
+        assert_eq!(stats.nodes_persisted, 0);
+    }
+
+    let counter2 = ComputeCounter::new();
+    let dice = make_dice(tmp.path())?;
+    dice.load_persisted_snapshot(&meta, DIGEST)
+        .await?
+        .expect("snapshot should load");
+    let mut updater = dice.updater_with_data(user_data_with_counter(&counter2));
+    updater.changed_to(vec![(Leaf(1), 5u64)])?;
+    let mut tx = updater.commit().await;
+    assert_eq!(tx.compute(&Derived(1)).await?, 50);
+    assert_eq!(counter2.count(), 1, "denied node recomputes");
     Ok(())
 }

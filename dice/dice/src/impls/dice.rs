@@ -177,6 +177,7 @@ impl Dice {
         self: &Arc<Self>,
         meta_path: &std::path::Path,
         inputs_digest: [u8; 32],
+        deny_key_types: &std::collections::HashSet<String>,
     ) -> anyhow::Result<crate::persist::PersistStats> {
         self.page_out().await?;
         let Some(storage) = self.pagable_storage.as_ref() else {
@@ -190,6 +191,7 @@ impl Dice {
             storage,
             meta_path,
             inputs_digest,
+            deny_key_types,
         )
         .await
     }

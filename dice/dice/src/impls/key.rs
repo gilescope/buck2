@@ -518,6 +518,17 @@ pub(crate) struct ProjectionWithBase {
 }
 
 impl ProjectionWithBase {
+    /// Persist support: reassemble from a deserialized projection dyn and a
+    /// remapped base key.
+    pub(crate) fn from_persisted_parts(base: DiceKey, proj: Arc<dyn DiceProjectionDyn>) -> Self {
+        ProjectionWithBase { base, proj }
+    }
+
+    /// Persist support: the dyn projection, Arc'd, for typetag serialization.
+    pub(crate) fn proj_arc(&self) -> &Arc<dyn DiceProjectionDyn> {
+        &self.proj
+    }
+
     pub(crate) fn base(&self) -> DiceKey {
         self.base
     }

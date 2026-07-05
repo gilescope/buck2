@@ -85,9 +85,19 @@ impl ServerCommandTemplate for HydrationServerCommand {
                 if let Some((meta_path, digest)) =
                     buck2_build_api::configure_dice::dice_snapshot_env_config()
                 {
+                    // Values that serialize but cannot survive hydration
+                    // (frozen starlark modules carry skipped native-function
+                    // slots that panic on deserialize) persist key-only.
+                    let deny: std::collections::HashSet<String> =
+                        std::env::var("BUCK2_DICE_SNAPSHOT_DENY")
+                            .unwrap_or_else(|_| "EvalImportKey".to_owned())
+                            .split(',')
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.trim().to_owned())
+                            .collect();
                     let stats = self
                         .dice
-                        .save_persisted_snapshot(&meta_path, digest)
+                        .save_persisted_snapshot(&meta_path, digest, &deny)
                         .await
                         .map_err(|e| {
                             buck2_error::conversion::from_any_with_tag(

@@ -65,7 +65,7 @@ use crate::versions::VersionRanges;
 
 /// Bump on ANY change to the persisted types below (bincode is sensitive to
 /// field order and enum layout). Mismatch => cold start.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 pub(crate) const SNAPSHOT_MAGIC: [u8; 8] = *b"DICE\0SNP";
 
@@ -217,9 +217,19 @@ pub(crate) enum PersistValueExtract {
 /// One node in the metadata file. Blobs live in the `DiceStorage` backend,
 /// referenced by content-addressed `DataKey` (u128).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+enum PersistedKey {
+    /// A regular key: one typetag blob.
+    Plain { blob: u128 },
+    /// A projection: the projection's typetag blob plus the base key's
+    /// record ordinal (projections sort after all plain records, so the base
+    /// always resolves in a single forward pass).
+    Projection { proj_blob: u128, base: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Record {
     Occupied {
-        key_blob: u128,
+        key: PersistedKey,
         /// Ordinals into the record list. `u64::MAX` = the dep could not be
         /// persisted; the loader drops this record (dep will recompute, and
         /// this node will follow via CheckDeps).
@@ -229,35 +239,25 @@ enum Record {
         value_blob: u128,
     },
     Injected {
-        key_blob: u128,
+        key: PersistedKey,
         first_valid_version: u64,
         /// Wire form of the key's `InvalidationSourcePriority`.
         priority: u8,
         value_blob: u128,
     },
     /// Key interned for dep-edge resolution, but no node installed (its
-    /// value could not be serialized). Dependents stay alive: the dep
-    /// recomputes on demand and equality-based reuse may still rescue the
-    /// subtree above it.
-    KeyOnly { key_blob: u128 },
+    /// value could not be serialized, or its type is denylisted). Dependents
+    /// stay alive: the dep recomputes on demand and equality-based reuse may
+    /// still rescue the subtree above it.
+    KeyOnly { key: PersistedKey },
 }
 
 impl Record {
-    fn key_blob(&self) -> u128 {
+    fn key(&self) -> &PersistedKey {
         match self {
-            Record::Occupied { key_blob, .. }
-            | Record::Injected { key_blob, .. }
-            | Record::KeyOnly { key_blob } => *key_blob,
-        }
-    }
-
-    /// Canonical ordering for byte-stable output: kind tag, then
-    /// content-addressed key blob.
-    fn sort_key(&self) -> (u8, u128) {
-        match self {
-            Record::Occupied { key_blob, .. } => (0, *key_blob),
-            Record::Injected { key_blob, .. } => (1, *key_blob),
-            Record::KeyOnly { key_blob } => (2, *key_blob),
+            Record::Occupied { key, .. }
+            | Record::Injected { key, .. }
+            | Record::KeyOnly { key } => key,
         }
     }
 }
@@ -300,27 +300,19 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> anyhow::Result<T> {
     Ok(value)
 }
 
-/// Serialize an erased key (tag + body via `pagable_typetag`) into the store.
-/// Returns None for keys with no registered serialization (projections are
-/// not yet supported - S2).
-fn store_key_blob(
+type FinishedMap = DashMap<usize, Arc<pagable::storage::traits::ArcSerSlot>>;
+
+/// Serialize one typetag-tagged dyn blob into the store. Returns None if the
+/// type's fields lack Pagable impls (treated as unpersistable, not fatal).
+fn store_tagged_blob<T: PagableSerialize + ?Sized>(
     storage: &DiceStorage,
-    key: &DiceKeyErased,
-    finished: &DashMap<usize, Arc<pagable::storage::traits::ArcSerSlot>>,
+    value: &T,
+    finished: &FinishedMap,
 ) -> Option<pagable::DataKey> {
-    let DiceKeyErased::Key(k) = key else {
-        return None; // Projection keys: S2.
-    };
     let session_context = storage.storage().session_context();
     let mut ser = SerializerForPaging::new(session_context);
-    // A key type whose fields lack Pagable impls fails here; treat as
-    // unpersistable rather than fatal.
-    match <dyn crate::impls::key::DiceKeyDyn as PagableSerialize>::pagable_serialize(
-        k.as_ref(),
-        &mut ser,
-    ) {
-        Ok(()) => {}
-        Err(_) => return None,
+    if value.pagable_serialize(&mut ser).is_err() {
+        return None;
     }
     let (data, arcs) = ser.finish();
     storage
@@ -329,77 +321,119 @@ fn store_key_blob(
         .ok()
 }
 
+/// The saver's view of one node's key: plain blob, projection parts, or
+/// unpersistable.
+enum SavedKey {
+    Plain(pagable::DataKey),
+    /// Base still a live DiceKey here; resolved to an ordinal later.
+    Projection(pagable::DataKey, DiceKey),
+    Unpersistable,
+}
+
+fn save_key(storage: &DiceStorage, key: &DiceKeyErased, finished: &FinishedMap) -> SavedKey {
+    match key {
+        DiceKeyErased::Key(k) => {
+            match store_tagged_blob::<dyn crate::impls::key::DiceKeyDyn>(
+                storage,
+                k.as_ref(),
+                finished,
+            ) {
+                Some(dk) => SavedKey::Plain(dk),
+                None => SavedKey::Unpersistable,
+            }
+        }
+        DiceKeyErased::Projection(p) => {
+            match store_tagged_blob::<dyn crate::impls::key::DiceProjectionDyn>(
+                storage,
+                p.proj_arc().as_ref(),
+                finished,
+            ) {
+                Some(dk) => SavedKey::Projection(dk, p.base()),
+                None => SavedKey::Unpersistable,
+            }
+        }
+    }
+}
+
 /// Save the current graph as a snapshot: values into the `DiceStorage`
 /// backend, skeleton into `meta_path`. Caller must ensure DICE is idle and
 /// should run `Dice::page_out()` first so most values already have
 /// `DataKey`s.
+///
+/// `deny_key_types` (matched against `key_type_name`) forces key-only
+/// persistence for values that would serialize but not survive
+/// deserialization (e.g. buck2's `EvalImportKey`: frozen starlark modules
+/// serialize with skipped native-function slots that panic on hydrate).
 pub(crate) async fn save_snapshot(
     state: &CoreStateHandle,
     key_index: &DiceKeyIndex,
     storage: &DiceStorage,
     meta_path: &Path,
     inputs_digest: [u8; 32],
+    deny_key_types: &std::collections::HashSet<String>,
 ) -> anyhow::Result<PersistStats> {
     let (version, extracts) = state.persist_extract().await;
     let mut stats = PersistStats::default();
-    let finished = DashMap::new();
+    let finished = FinishedMap::new();
 
-    // First pass: serialize keys and values, build records keyed by DiceKey.
-    let mut records: Vec<(DiceKey, Record)> = Vec::with_capacity(extracts.len());
-    let mut persistable: std::collections::HashMap<DiceKey, bool> =
-        std::collections::HashMap::new();
+    // Serialize keys and values; projections are separated because their
+    // canonical position depends on their base's ordinal.
+    struct Staged {
+        dice_key: DiceKey,
+        saved_key: SavedKey,
+        body: StagedBody,
+    }
+    enum StagedBody {
+        Occupied {
+            deps: Vec<DiceKey>,
+            verified_ranges: PersistedVersionRanges,
+            dirtied_history: PersistedForceDirty,
+            value_blob: Option<u128>,
+        },
+        Injected {
+            first_valid_version: u64,
+            priority: u8,
+            value_blob: u128,
+        },
+    }
 
+    let mut staged: Vec<Staged> = Vec::with_capacity(extracts.len());
     for extract in &extracts {
-        let (key, ok) = match extract {
-            PersistNodeExtract::Occupied { key, value, .. } => {
+        match extract {
+            PersistNodeExtract::Occupied {
+                key,
+                deps,
+                verified_ranges,
+                dirtied_history,
+                value,
+            } => {
                 let key_erased = key_index.get(*key);
-                let key_blob = store_key_blob(storage, key_erased, &finished);
-                let value_blob = match (key_blob, value) {
-                    (None, _) => None,
-                    (Some(_), PersistValueExtract::Paged(dk)) => Some(*dk),
-                    (Some(_), PersistValueExtract::Hydrated(v)) => {
-                        storage.store_value_blob(key_erased, v.dupe(), &finished)?
+                let saved_key = save_key(storage, key_erased, &finished);
+                if matches!(saved_key, SavedKey::Unpersistable) {
+                    stats.dropped_unserializable += 1;
+                    continue;
+                }
+                let denied = deny_key_types.contains(key_erased.key_type_name());
+                let value_blob = if denied {
+                    None
+                } else {
+                    match value {
+                        PersistValueExtract::Paged(dk) => Some(dk.0),
+                        PersistValueExtract::Hydrated(v) => storage
+                            .store_value_blob(key_erased, v.dupe(), &finished)?
+                            .map(|dk| dk.0),
                     }
                 };
-                match (key_blob, value_blob) {
-                    (Some(kb), Some(vb)) => {
-                        records.push((
-                            *key,
-                            Record::Occupied {
-                                key_blob: kb.0,
-                                deps: Vec::new(), // filled after ordinals exist
-                                verified_ranges: PersistedVersionRanges::from_internal(
-                                    match extract {
-                                        PersistNodeExtract::Occupied {
-                                            verified_ranges, ..
-                                        } => verified_ranges,
-                                        _ => unreachable!(),
-                                    },
-                                ),
-                                dirtied_history: PersistedForceDirty::from_internal(
-                                    match extract {
-                                        PersistNodeExtract::Occupied {
-                                            dirtied_history, ..
-                                        } => dirtied_history,
-                                        _ => unreachable!(),
-                                    },
-                                ),
-                                value_blob: vb.0,
-                            },
-                        ));
-                        (*key, true)
-                    }
-                    (Some(kb), None) => {
-                        // Value unserializable: keep the key for dep edges.
-                        records.push((*key, Record::KeyOnly { key_blob: kb.0 }));
-                        stats.keys_only += 1;
-                        (*key, true)
-                    }
-                    (None, _) => {
-                        stats.dropped_unserializable += 1;
-                        (*key, false)
-                    }
-                }
+                staged.push(Staged {
+                    dice_key: *key,
+                    saved_key,
+                    body: StagedBody::Occupied {
+                        deps: deps.clone(),
+                        verified_ranges: PersistedVersionRanges::from_internal(verified_ranges),
+                        dirtied_history: PersistedForceDirty::from_internal(dirtied_history),
+                        value_blob,
+                    },
+                });
             }
             PersistNodeExtract::Injected {
                 key,
@@ -407,75 +441,139 @@ pub(crate) async fn save_snapshot(
                 value,
             } => {
                 let key_erased = key_index.get(*key);
-                let key_blob = store_key_blob(storage, key_erased, &finished);
-                let value_blob = match key_blob {
-                    None => None,
-                    Some(_) => storage.store_value_blob(key_erased, value.dupe(), &finished)?,
+                let saved_key = save_key(storage, key_erased, &finished);
+                let denied = deny_key_types.contains(key_erased.key_type_name());
+                let value_blob = if denied {
+                    None
+                } else {
+                    storage
+                        .store_value_blob(key_erased, value.dupe(), &finished)?
+                        .map(|dk| dk.0)
                 };
-                let priority = key_erased.invalidation_source_priority();
-                match (key_blob, value_blob) {
-                    (Some(kb), Some(vb)) => {
-                        records.push((
-                            *key,
-                            Record::Injected {
-                                key_blob: kb.0,
+                match (&saved_key, value_blob) {
+                    (SavedKey::Plain(_), Some(vb)) => {
+                        staged.push(Staged {
+                            dice_key: *key,
+                            saved_key,
+                            body: StagedBody::Injected {
                                 first_valid_version: first_valid_version.value() as u64,
-                                priority: priority_to_wire(priority),
-                                value_blob: vb.0,
+                                priority: priority_to_wire(
+                                    key_erased.invalidation_source_priority(),
+                                ),
+                                value_blob: vb,
                             },
-                        ));
-                        (*key, true)
+                        });
                     }
                     _ => {
+                        // An injected leaf without its value is useless (it
+                        // is the diff baseline); drop it. Its dependents
+                        // survive as records but drop at load via dangling
+                        // deps - correct, and accounted.
                         stats.dropped_unserializable += 1;
-                        (*key, false)
                     }
                 }
             }
-        };
-        persistable.insert(key, ok);
-    }
-
-    // Canonical order (kind, content-hash) => byte-stable metadata for
-    // identical graphs regardless of HashMap iteration order.
-    records.sort_by_key(|(_, r)| r.sort_key());
-    let ordinal_of: std::collections::HashMap<DiceKey, u64> = records
-        .iter()
-        .enumerate()
-        .map(|(i, (k, _))| (*k, i as u64))
-        .collect();
-
-    // Second pass: resolve dep ordinals.
-    for extract in &extracts {
-        let PersistNodeExtract::Occupied { key, deps, .. } = extract else {
-            continue;
-        };
-        let Some(ordinal) = ordinal_of.get(key) else {
-            continue; // node was dropped
-        };
-        let dep_ordinals: Vec<u64> = deps
-            .iter()
-            .map(|d| ordinal_of.get(d).copied().unwrap_or(u64::MAX))
-            .collect();
-        if let Record::Occupied { deps: slot, .. } = &mut records[*ordinal as usize].1 {
-            *slot = dep_ordinals;
         }
     }
 
-    stats.nodes_persisted = records
-        .iter()
-        .filter(|(_, r)| matches!(r, Record::Occupied { .. }))
-        .count();
-    stats.nodes_injected = records
-        .iter()
-        .filter(|(_, r)| matches!(r, Record::Injected { .. }))
-        .count();
+    // Canonical order: plain records sorted by (kind, key blob) first, then
+    // projections by (proj blob, base ordinal). Deterministic for identical
+    // graphs regardless of HashMap iteration order.
+    fn plain_rank(s: &Staged) -> Option<(u8, u128)> {
+        match (&s.saved_key, &s.body) {
+            (SavedKey::Plain(dk), StagedBody::Occupied { value_blob, .. }) => {
+                Some((if value_blob.is_some() { 0 } else { 2 }, dk.0))
+            }
+            (SavedKey::Plain(dk), StagedBody::Injected { .. }) => Some((1, dk.0)),
+            (SavedKey::Projection(..), _) => None,
+            (SavedKey::Unpersistable, _) => unreachable!("filtered above"),
+        }
+    }
+    let (mut plains, mut projections): (Vec<Staged>, Vec<Staged>) = staged
+        .into_iter()
+        .partition(|s| matches!(s.saved_key, SavedKey::Plain(_)));
+    plains.sort_by_key(|s| plain_rank(s).unwrap());
+
+    let mut ordinal_of: std::collections::HashMap<DiceKey, u64> = std::collections::HashMap::new();
+    for (i, s) in plains.iter().enumerate() {
+        ordinal_of.insert(s.dice_key, i as u64);
+    }
+    // Projections whose base did not survive are dropped here.
+    projections.retain(|s| match &s.saved_key {
+        SavedKey::Projection(_, base) => {
+            let keep = ordinal_of.contains_key(base);
+            if !keep {
+                stats.dropped_dangling_dep += 1;
+            }
+            keep
+        }
+        _ => unreachable!(),
+    });
+    projections.sort_by_key(|s| match &s.saved_key {
+        SavedKey::Projection(dk, base) => (dk.0, ordinal_of[base]),
+        _ => unreachable!(),
+    });
+    for (i, s) in projections.iter().enumerate() {
+        ordinal_of.insert(s.dice_key, (plains.len() + i) as u64);
+    }
+
+    let all: Vec<Staged> = plains.into_iter().chain(projections).collect();
+    let mut records: Vec<Record> = Vec::with_capacity(all.len());
+    for s in &all {
+        let key = match &s.saved_key {
+            SavedKey::Plain(dk) => PersistedKey::Plain { blob: dk.0 },
+            SavedKey::Projection(dk, base) => PersistedKey::Projection {
+                proj_blob: dk.0,
+                base: ordinal_of[base],
+            },
+            SavedKey::Unpersistable => unreachable!(),
+        };
+        match &s.body {
+            StagedBody::Occupied {
+                deps,
+                verified_ranges,
+                dirtied_history,
+                value_blob,
+            } => match value_blob {
+                Some(vb) => {
+                    records.push(Record::Occupied {
+                        key,
+                        deps: deps
+                            .iter()
+                            .map(|d| ordinal_of.get(d).copied().unwrap_or(u64::MAX))
+                            .collect(),
+                        verified_ranges: verified_ranges.clone(),
+                        dirtied_history: dirtied_history.clone(),
+                        value_blob: *vb,
+                    });
+                    stats.nodes_persisted += 1;
+                }
+                None => {
+                    records.push(Record::KeyOnly { key });
+                    stats.keys_only += 1;
+                }
+            },
+            StagedBody::Injected {
+                first_valid_version,
+                priority,
+                value_blob,
+            } => {
+                records.push(Record::Injected {
+                    key,
+                    first_valid_version: *first_valid_version,
+                    priority: *priority,
+                    value_blob: *value_blob,
+                });
+                stats.nodes_injected += 1;
+            }
+        }
+    }
 
     storage.storage().flush()?;
 
     let meta = MetaFile {
         header: SnapshotHeader::new(inputs_digest, records.len() as u64, version.value() as u64),
-        records: records.into_iter().map(|(_, r)| r).collect(),
+        records,
     };
     let bytes = encode(&meta)?;
     let tmp = meta_path.with_extension("tmp");
@@ -508,35 +606,54 @@ pub(crate) async fn load_snapshot(
     let at_version = VersionNumber::new(meta.header.max_version as usize);
     let mut stats = PersistStats::default();
 
-    // Pass 1: fetch + deserialize + intern every key. A failed key (unknown
-    // tag after a code change, corrupt blob) leaves None; nodes referencing
-    // it are dropped.
+    // Pass 1: fetch + deserialize + intern every key. Plain keys resolve
+    // directly; projections resolve against earlier records (they always
+    // sort after every plain record, and after any projection they base on).
     let handle = PagableStorageHandle::new(storage.storage().dupe());
     let mut dice_keys: Vec<Option<DiceKey>> = Vec::with_capacity(meta.records.len());
     let mut erased_keys: Vec<Option<DiceKeyErased>> = Vec::with_capacity(meta.records.len());
     for record in &meta.records {
-        let data_key = pagable::DataKey(record.key_blob());
-        let loaded = match storage.storage().fetch_data(&data_key).await {
-            Ok(data) => {
-                let mut deser = PagableDeserializerImpl::new(&data.data, &data.arcs, &handle);
-                match <dyn crate::impls::key::DiceKeyDyn as PagableBoxDeserialize>::deserialize_box(
-                    &mut deser,
-                ) {
-                    Ok(boxed) => {
-                        let erased = DiceKeyErased::Key(Arc::from(boxed));
-                        let dice_key =
-                            key_index.index(CowDiceKeyHashed::from_erased(erased.dupe()));
-                        Some((dice_key, erased))
-                    }
-                    Err(_) => None,
+        let loaded = match record.key() {
+            PersistedKey::Plain { blob } => {
+                match fetch_and_deserialize::<dyn crate::impls::key::DiceKeyDyn>(
+                    storage,
+                    &handle,
+                    pagable::DataKey(*blob),
+                )
+                .await
+                {
+                    Some(boxed) => Some(DiceKeyErased::Key(Arc::from(boxed))),
+                    None => None,
                 }
             }
-            Err(_) => None,
+            PersistedKey::Projection { proj_blob, base } => {
+                let base_key = usize::try_from(*base)
+                    .ok()
+                    .and_then(|ix| dice_keys.get(ix).copied().flatten());
+                match (
+                    base_key,
+                    fetch_and_deserialize::<dyn crate::impls::key::DiceProjectionDyn>(
+                        storage,
+                        &handle,
+                        pagable::DataKey(*proj_blob),
+                    )
+                    .await,
+                ) {
+                    (Some(bk), Some(boxed)) => Some(DiceKeyErased::Projection(
+                        crate::impls::key::ProjectionWithBase::from_persisted_parts(
+                            bk,
+                            Arc::from(boxed),
+                        ),
+                    )),
+                    _ => None,
+                }
+            }
         };
         match loaded {
-            Some((dk, er)) => {
-                dice_keys.push(Some(dk));
-                erased_keys.push(Some(er));
+            Some(erased) => {
+                let dice_key = key_index.index(CowDiceKeyHashed::from_erased(erased.dupe()));
+                dice_keys.push(Some(dice_key));
+                erased_keys.push(Some(erased));
             }
             None => {
                 stats.dropped_unserializable += 1;
@@ -621,4 +738,17 @@ pub(crate) async fn load_snapshot(
 
     state.persist_install(nodes, at_version).await;
     Ok(Some(stats))
+}
+
+async fn fetch_and_deserialize<T: ?Sized>(
+    storage: &DiceStorage,
+    handle: &PagableStorageHandle,
+    data_key: pagable::DataKey,
+) -> Option<Box<T>>
+where
+    for<'de> T: PagableBoxDeserialize<'de>,
+{
+    let data = storage.storage().fetch_data(&data_key).await.ok()?;
+    let mut deser = PagableDeserializerImpl::new(&data.data, &data.arcs, handle);
+    T::deserialize_box(&mut deser).ok()
 }
