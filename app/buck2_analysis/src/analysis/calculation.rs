@@ -144,7 +144,9 @@ impl ValueSerialize for AnalysisValueSerialize {
         let Ok(v) = v else {
             return None;
         };
-        if std::env::var_os("BUCK2_DICE_SNAPSHOT_PATH").is_some() {
+        let strip = std::env::var_os("BUCK2_DICE_SNAPSHOT_PATH").is_some()
+            && std::env::var_os("BUCK2_DICE_SNAPSHOT_FULL_ANALYSIS").is_none();
+        if strip {
             let stripped = match v {
                 MaybeCompatible::Compatible(r) => {
                     MaybeCompatible::Compatible(r.actions_only_for_persist())

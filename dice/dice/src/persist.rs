@@ -311,14 +311,24 @@ fn store_tagged_blob<T: PagableSerialize + ?Sized>(
 ) -> Option<pagable::DataKey> {
     let session_context = storage.storage().session_context();
     let mut ser = SerializerForPaging::new(session_context);
-    if value.pagable_serialize(&mut ser).is_err() {
-        return None;
+    // PagablePanic-marked types panic instead of erroring; either way the
+    // key is unpersistable, never fatal.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        value.pagable_serialize(&mut ser)
+    })) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return None,
     }
     let (data, arcs) = ser.finish();
-    storage
-        .storage()
-        .page_out_item(data, arcs, finished, session_context)
-        .ok()
+    // Nested arcs serialize inside page_out_item; same panic policy.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        storage
+            .storage()
+            .page_out_item(data, arcs, finished, session_context)
+            .ok()
+    }))
+    .ok()
+    .flatten()
 }
 
 /// The saver's view of one node's key: plain blob, projection parts, or
