@@ -7,13 +7,19 @@ Status: design proposal, unimplemented. Fork planning document
 
 DICE state lives only in the daemon's memory. Long-lived daemons (Meta's
 deployment) never notice; ephemeral-CI deployments pay full parse +
-configure + analysis on every run. Concrete numbers from a distributed-RE
-sweep of ~2,185 third-party crates on GitHub Actions runners
-(gilescope/rebuck's rebuck2 engine): with a warm remote action cache the
-build phase is ~97% cache hits, and the dominant residual cost is the
-~2 minutes of cold-daemon graph computation that no action cache can touch.
-Persistence turns "recompute the world's shape" into "reload it and check
-what moved".
+configure + analysis on every run — a cost no action cache can touch, and
+one that scales with graph size and rule complexity rather than with what
+changed. Persistence turns "recompute the world's shape" into "reload it
+and check what moved".
+
+**S0 measurement + target workload (2026-07-05)**: on a flat third-party rig
+(2,181 alias targets) the whole graph stack is cheap - parse 1.1s /
+configure 0.6s / analysis 9.9s cold, 13.9s total after a daemon kill - so
+small flat graphs are NOT the payoff. The motivating workload is large
+first-party graphs: substrate-scale builds (~1M edges) measured at ~6
+minutes of graph computation in Bazel. Deep dependency chains and heavy
+rule/starlark evaluation are where reload-and-diff beats recompute by an
+order of magnitude; this matches the workload Bazel built Skycache for.
 
 ## The key observation: the algorithm already exists
 
