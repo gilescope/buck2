@@ -409,6 +409,34 @@ impl ForceDirtyHistory {
         Self { versions: None }
     }
 
+    /// Persist support: the raw force-dirty versions and their source
+    /// priority. This history is load-bearing (see `restricted_range`):
+    /// a persister must round-trip it verbatim or stale reuse becomes
+    /// possible across a force-dirtied version.
+    pub(crate) fn parts_for_persist(
+        &self,
+    ) -> Option<(&[VersionNumber], InvalidationSourcePriority)> {
+        self.versions.as_ref().map(|b| (b.0.as_slice(), b.1))
+    }
+
+    /// Persist support: rebuild from `parts_for_persist` output.
+    pub(crate) fn from_persisted_parts(
+        versions: Vec<VersionNumber>,
+        priority: InvalidationSourcePriority,
+    ) -> Self {
+        debug_assert!(
+            versions.windows(2).all(|w| w[0] < w[1]),
+            "force-dirty versions must be strictly increasing"
+        );
+        if versions.is_empty() {
+            Self { versions: None }
+        } else {
+            Self {
+                versions: Some(Box::new((versions, priority))),
+            }
+        }
+    }
+
     /// Marks a version as force-dirtied. Returns true if the version was not already marked.
     ///
     /// Should only ever be called at increasing version numbers.

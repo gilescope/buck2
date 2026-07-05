@@ -82,6 +82,21 @@ pub(crate) struct VersionRange {
     end: Option<VersionNumber>,
 }
 
+impl VersionRange {
+    /// Persist support: raw parts.
+    pub(crate) fn parts_for_persist(&self) -> (VersionNumber, Option<VersionNumber>) {
+        (self.begin, self.end)
+    }
+
+    /// Persist support: rebuild from `parts_for_persist` output.
+    pub(crate) fn from_persisted_parts(begin: VersionNumber, end: Option<VersionNumber>) -> Self {
+        if let Some(e) = end {
+            debug_assert!(begin < e, "VersionRange begin must precede end");
+        }
+        VersionRange { begin, end }
+    }
+}
+
 impl Display for VersionRange {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "[{}, ", self.begin)?;
@@ -271,6 +286,22 @@ impl Display for VersionRanges {
 }
 
 impl VersionRanges {
+    /// Persist support: the raw sorted interval list.
+    pub(crate) fn ranges_for_persist(&self) -> &[VersionRange] {
+        &self.0
+    }
+
+    /// Persist support: rebuild from intervals saved by `ranges_for_persist`.
+    /// Caller must supply the same sorted, non-overlapping list this type
+    /// maintains internally.
+    pub(crate) fn from_persisted_ranges(ranges: Vec<VersionRange>) -> Self {
+        debug_assert!(
+            ranges.windows(2).all(|w| w[0].end.is_some() && w[0].end.unwrap() < w[1].begin),
+            "persisted VersionRanges must be sorted and non-overlapping"
+        );
+        VersionRanges(ranges)
+    }
+
     /// Returns the last range if this is non-empty.
     pub(crate) fn last(&self) -> Option<VersionRange> {
         self.0.last().copied()

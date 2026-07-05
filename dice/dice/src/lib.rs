@@ -199,6 +199,7 @@ pub(crate) mod future;
 mod impls;
 pub mod introspection;
 pub(crate) mod metrics;
+pub(crate) mod persist;
 pub(crate) mod stats;
 mod transaction;
 mod transaction_update;
