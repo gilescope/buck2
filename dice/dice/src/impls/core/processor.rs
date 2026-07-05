@@ -152,6 +152,17 @@ impl StateProcessor {
             StateRequest::Rehydrate { key, value } => {
                 self.state.rehydrate(key, value);
             }
+            StateRequest::PersistExtract { resp } => {
+                let _ignored = resp.send(self.state.persist_extract());
+            }
+            StateRequest::PersistInstall {
+                nodes,
+                at_version,
+                resp,
+            } => {
+                self.state.persist_install(nodes, at_version);
+                let _ignored = resp.send(());
+            }
             StateRequest::Metrics { resp } => {
                 let _ignored = resp.send(self.state.metrics());
             }

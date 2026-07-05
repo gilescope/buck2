@@ -15,6 +15,7 @@ mod events;
 mod general;
 mod keys;
 mod page_out;
+mod persist;
 mod spawner;
 mod transients;
 mod user_data;

@@ -296,7 +296,9 @@ impl VersionRanges {
     /// maintains internally.
     pub(crate) fn from_persisted_ranges(ranges: Vec<VersionRange>) -> Self {
         debug_assert!(
-            ranges.windows(2).all(|w| w[0].end.is_some() && w[0].end.unwrap() < w[1].begin),
+            ranges
+                .windows(2)
+                .all(|w| w[0].end.is_some() && w[0].end.unwrap() < w[1].begin),
             "persisted VersionRanges must be sorted and non-overlapping"
         );
         VersionRanges(ranges)

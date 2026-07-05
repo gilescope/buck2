@@ -168,6 +168,55 @@ impl Dice {
     /// `wait_for_idle()` first.
     ///
     /// No-op if `DiceStorage` was not configured on the builder.
+    /// Persist the whole graph as a snapshot: values into the configured
+    /// `DiceStorage`, skeleton into `meta_path`. `inputs_digest` should hash
+    /// everything identity-defining (binary, configs) - load validates it.
+    ///
+    /// Caller must ensure DICE is idle (`wait_for_idle().await`).
+    pub async fn save_persisted_snapshot(
+        self: &Arc<Self>,
+        meta_path: &std::path::Path,
+        inputs_digest: [u8; 32],
+    ) -> anyhow::Result<crate::persist::PersistStats> {
+        self.page_out().await?;
+        let Some(storage) = self.pagable_storage.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "save_persisted_snapshot requires pagable storage (set_pagable_storage)"
+            ));
+        };
+        crate::persist::save_snapshot(
+            &self.state_handle,
+            &self.key_index,
+            storage,
+            meta_path,
+            inputs_digest,
+        )
+        .await
+    }
+
+    /// Load a snapshot saved by `save_persisted_snapshot` into this
+    /// freshly-built DICE. Returns `Ok(None)` = cold start (missing file or
+    /// header mismatch). Must be called before any computation runs.
+    pub async fn load_persisted_snapshot(
+        self: &Arc<Self>,
+        meta_path: &std::path::Path,
+        inputs_digest: [u8; 32],
+    ) -> anyhow::Result<Option<crate::persist::PersistStats>> {
+        let Some(storage) = self.pagable_storage.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "load_persisted_snapshot requires pagable storage (set_pagable_storage)"
+            ));
+        };
+        crate::persist::load_snapshot(
+            &self.state_handle,
+            &self.key_index,
+            storage,
+            meta_path,
+            inputs_digest,
+        )
+        .await
+    }
+
     pub async fn page_out(self: &Arc<Self>) -> anyhow::Result<()> {
         if !self.is_idle().await {
             return Err(anyhow::anyhow!(

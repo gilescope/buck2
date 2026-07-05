@@ -65,6 +65,23 @@ impl DiceStorage {
         }
     }
 
+    /// Persist support: the underlying backend, for storing/fetching the
+    /// snapshot's key blobs alongside the paged values.
+    pub(crate) fn storage(&self) -> &Arc<dyn PagableStorage> {
+        &self.storage
+    }
+
+    /// Persist support: serialize one value into the store, returning its
+    /// content-addressed key. `None` = the key's `ValueSerialize` declined.
+    pub(crate) fn store_value_blob(
+        &self,
+        key_dyn: &DiceKeyErased,
+        value: DiceValidValue,
+        finished: &DashMap<usize, Arc<ArcSerSlot>>,
+    ) -> anyhow::Result<Option<DataKey>> {
+        self.page_out_value(key_dyn, value, finished)
+    }
+
     /// Cumulative page-in counters per key type since this `DiceStorage` was
     /// created.
     pub(crate) fn page_in_metrics_snapshot(&self) -> HashMap<&'static str, PageInKeyTypeMetrics> {

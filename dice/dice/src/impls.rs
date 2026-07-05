@@ -11,13 +11,13 @@
 pub(crate) mod cache;
 pub(crate) mod core;
 pub(crate) mod ctx;
-mod deps;
+pub(crate) mod deps;
 pub(crate) mod dice;
 pub(crate) mod evaluator;
 pub(crate) mod events;
 mod hash;
 pub(crate) mod key;
-mod key_index;
+pub(crate) mod key_index;
 pub(crate) mod opaque;
 pub(crate) mod storage;
 pub(crate) mod task;

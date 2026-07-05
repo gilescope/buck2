@@ -193,6 +193,56 @@ impl CoreState {
         }
     }
 
+    /// Persist support: extract every node's snapshot metadata. Runs on the
+    /// state thread; everything returned is plain data + Arc clones.
+    pub(super) fn persist_extract(
+        &self,
+    ) -> (VersionNumber, Vec<crate::persist::PersistNodeExtract>) {
+        use crate::persist::PersistNodeExtract;
+        use crate::persist::PersistValueExtract;
+        let mut out = Vec::with_capacity(self.graph.nodes.len());
+        for (key, node) in &self.graph.nodes {
+            match node {
+                VersionedGraphNode::Occupied(occ) => {
+                    let (deps, ranges, dirtied) = occ.parts_for_persist();
+                    let value = match (occ.val().data_key(), occ.val().as_hydrated()) {
+                        (Some(dk), _) => PersistValueExtract::Paged(dk),
+                        (None, Some(v)) => PersistValueExtract::Hydrated(v.dupe()),
+                        (None, None) => continue, // unreachable by PagableNodeValue invariant
+                    };
+                    out.push(PersistNodeExtract::Occupied {
+                        key: *key,
+                        deps: deps.iter_keys().collect(),
+                        verified_ranges: ranges.clone(),
+                        dirtied_history: dirtied.clone(),
+                        value,
+                    });
+                }
+                VersionedGraphNode::Injected(inj) => {
+                    let (first_valid, value) = inj.latest_for_persist();
+                    out.push(PersistNodeExtract::Injected {
+                        key: *key,
+                        first_valid_version: first_valid,
+                        value: value.dupe(),
+                    });
+                }
+                VersionedGraphNode::Vacant(_) => {}
+            }
+        }
+        (self.version_tracker.current(), out)
+    }
+
+    /// Persist support: install reconstructed nodes and resume version
+    /// numbering at the snapshot's version.
+    pub(super) fn persist_install(
+        &mut self,
+        nodes: Vec<(DiceKey, VersionedGraphNode)>,
+        at_version: VersionNumber,
+    ) {
+        self.graph.install_persisted_nodes(nodes, at_version);
+        self.version_tracker.fast_forward_for_persist(at_version);
+    }
+
     /// Returns nodes whose value is resident in memory but has no on-disk
     /// copy yet. These need serialization before they can be paged out.
     pub(super) fn keys_to_page_out(&self) -> Vec<(DiceKey, DiceValidValue)> {

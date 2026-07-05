@@ -211,6 +211,39 @@ impl VersionedGraph {
         }
     }
 
+    /// Persist support: install nodes reconstructed from a snapshot into an
+    /// empty graph, then re-derive every rdep edge from the persisted dep
+    /// lists. rdeps are load-bearing for invalidation (a leaf change
+    /// propagates dirt through them), so a loaded graph without them would
+    /// serve stale values.
+    pub(crate) fn install_persisted_nodes(
+        &mut self,
+        nodes: Vec<(DiceKey, VersionedGraphNode)>,
+        at_version: VersionNumber,
+    ) {
+        assert!(
+            self.nodes.is_empty(),
+            "persisted snapshot must load into an empty graph"
+        );
+        let edges: Vec<(DiceKey, DiceKey)> = nodes
+            .iter()
+            .filter_map(|(k, node)| match node {
+                VersionedGraphNode::Occupied(occ) => {
+                    let (deps, _, _) = occ.parts_for_persist();
+                    Some(deps.iter_keys().map(|dep| (dep, *k)).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        self.nodes.extend(nodes);
+        for (dep, rdep) in edges {
+            if let Some(node) = self.nodes.get_mut(&dep) {
+                node.add_rdep_at(at_version, rdep);
+            }
+        }
+    }
+
     /// Gets the entry corresponding to the cache entry if up to date.
     pub(crate) fn get(&self, key: VersionedGraphKey) -> VersionedGraphResult {
         if let Some(entry) = self.nodes.get(&key.k) {

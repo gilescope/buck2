@@ -28,6 +28,7 @@ use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
 use crate::arc::Arc;
 use crate::impls::core::graph::introspection::VersionedGraphIntrospectable;
+use crate::impls::core::graph::nodes::VersionedGraphNode;
 use crate::impls::core::graph::types::VersionedGraphKey;
 use crate::impls::core::graph::types::VersionedGraphResult;
 use crate::impls::core::graph::types::VersionedGraphResultMismatch;
@@ -46,6 +47,7 @@ use crate::impls::value::DiceComputedValue;
 use crate::impls::value::DiceValidValue;
 use crate::impls::value::TrackedInvalidationPaths;
 use crate::metrics::Metrics;
+use crate::persist::PersistNodeExtract;
 use crate::versions::VersionNumber;
 
 /// Padded out to a full cache line so that two of these placed adjacent in a
@@ -286,6 +288,31 @@ impl CoreStateHandle {
     }
 
     /// Collect metrics
+    /// Persist support: extract snapshot metadata for every node.
+    pub(crate) fn persist_extract(
+        &self,
+    ) -> impl Future<Output = (VersionNumber, Vec<PersistNodeExtract>)> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(StateRequest::PersistExtract { resp }, recv)
+    }
+
+    /// Persist support: install reconstructed nodes into the (empty) graph.
+    pub(crate) fn persist_install(
+        &self,
+        nodes: Vec<(DiceKey, VersionedGraphNode)>,
+        at_version: VersionNumber,
+    ) -> impl Future<Output = ()> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(
+            StateRequest::PersistInstall {
+                nodes,
+                at_version,
+                resp,
+            },
+            recv,
+        )
+    }
+
     pub(crate) fn metrics(&self) -> Metrics {
         let (resp, recv) = oneshot::channel();
         self.request(StateRequest::Metrics { resp });
@@ -411,6 +438,20 @@ pub(super) enum StateRequest {
         key: DiceKey,
         #[derivative(Debug = "ignore")]
         value: DiceValidValue,
+    },
+    /// Persist support: extract every node's metadata for a snapshot, plus
+    /// the version it was taken at.
+    PersistExtract {
+        #[derivative(Debug = "ignore")]
+        resp: Sender<(VersionNumber, Vec<PersistNodeExtract>)>,
+    },
+    /// Persist support: install reconstructed nodes into an empty graph and
+    /// fast-forward the version counter to the snapshot's version.
+    PersistInstall {
+        #[derivative(Debug = "ignore")]
+        nodes: Vec<(DiceKey, VersionedGraphNode)>,
+        at_version: VersionNumber,
+        resp: Sender<()>,
     },
     /// Collect metrics
     Metrics { resp: Sender<Metrics> },
