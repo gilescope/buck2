@@ -121,15 +121,13 @@ impl Key for AnalysisKey {
     }
 }
 
-/// `OkPagableValueSerialize` semantics (Ok pages, Err stays resident), with
-/// the S3 "analysis dodge" layered on: when cross-restart snapshot
-/// persistence is active (`BUCK2_DICE_SNAPSHOT_PATH` set), the frozen
-/// starlark heap is stripped before serialization. Action lookups survive a
-/// restart; provider reads on a persisted-clean node return the existing
-/// "missing analysis storage" error (deny `AnalysisKey` via
-/// `BUCK2_DICE_SNAPSHOT_DENY` to opt out entirely). Heap references into
-/// .bzl module heaps cannot round-trip across processes, so shipping the
-/// heap here would trade a clean degradation for a hydrate-time panic.
+/// `OkPagableValueSerialize` semantics (Ok pages, Err stays resident).
+/// Analysis results serialize in full by default - provider heaps included
+/// (cross-heap enum equality made this sound; see EnumValueGen::equals).
+/// `BUCK2_DICE_SNAPSHOT_ACTIONS_ONLY=1` re-enables the S3 dodge: strip the
+/// frozen heap, keep the action graph. Action lookups always survive; on
+/// stripped values, provider reads return the standard "missing analysis
+/// storage" error.
 struct AnalysisValueSerialize;
 
 impl ValueSerialize for AnalysisValueSerialize {
@@ -144,8 +142,7 @@ impl ValueSerialize for AnalysisValueSerialize {
         let Ok(v) = v else {
             return None;
         };
-        let strip = std::env::var_os("BUCK2_DICE_SNAPSHOT_PATH").is_some()
-            && std::env::var_os("BUCK2_DICE_SNAPSHOT_FULL_ANALYSIS").is_none();
+        let strip = std::env::var_os("BUCK2_DICE_SNAPSHOT_ACTIONS_ONLY").is_some();
         if strip {
             let stripped = match v {
                 MaybeCompatible::Compatible(r) => {

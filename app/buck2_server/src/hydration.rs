@@ -90,15 +90,7 @@ impl ServerCommandTemplate for HydrationServerCommand {
                     // slots that panic on deserialize) persist key-only.
                     let deny: std::collections::HashSet<String> =
                         std::env::var("BUCK2_DICE_SNAPSHOT_DENY")
-                            .unwrap_or_else(|_| {
-                                // AnalysisKey: full provider round-trip is
-                                // unproven upstream (mis-deserializes in
-                                // anger) and stripped values error on
-                                // provider reads from dirty dependents. The
-                                // proven layers (file ops, configs, target
-                                // graph) warm-start; analysis recomputes.
-                                "EvalImportKey,AnalysisKey".to_owned()
-                            })
+                            .unwrap_or_else(|_| "EvalImportKey".to_owned())
                             .split(',')
                             .filter(|s| !s.is_empty())
                             .map(|s| s.trim().to_owned())
