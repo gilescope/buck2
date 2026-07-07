@@ -5,6 +5,18 @@ Status: **S1-S3 implemented** on this branch (see `dice/dice/src/persist.rs` and
 `impls/tests/persist.rs`); this doc now records the as-built decisions where they
 diverged from the pre-implementation design below.
 
+## Invariant learned in the field (2026-07-07)
+
+A DICE key whose compute has SIDE EFFECTS on per-daemon state must never
+be served clean across a process boundary. The concrete case: BuildKey's
+compute declares action outputs to the deferred materializer's in-memory
+artifact tree; a dice-clean BuildKey in a fresh daemon skips that, and the
+RE uploader then misclassifies undeclared outputs as source files ("not in
+tree => assume source") and opens paths that materializations=none never
+wrote. Hence the default snapshot denylist: EvalImportKey (hydrate panic),
+BuildKey + EnsureProjectedArtifactKey + EnsureTransitiveSetProjectionKey
+(materializer side effects). Re-execution is cheap: real actions AC-hit.
+
 ## As-built summary (2026-07-05)
 
 - Values ride Meta's existing page-out path (`DiceStorage`, content-addressed
