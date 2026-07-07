@@ -90,7 +90,19 @@ impl ServerCommandTemplate for HydrationServerCommand {
                     // slots that panic on deserialize) persist key-only.
                     let deny: std::collections::HashSet<String> =
                         std::env::var("BUCK2_DICE_SNAPSHOT_DENY")
-                            .unwrap_or_else(|_| "EvalImportKey".to_owned())
+                            .unwrap_or_else(|_| {
+                                // EvalImportKey: frozen modules panic on
+                                // hydrate (NativeFunc skip slots).
+                                // BuildKey + ensure keys: their computed
+                                // effect includes declaring outputs to the
+                                // per-daemon materializer tree - serving
+                                // them dice-clean in a fresh daemon leaves
+                                // write artifacts undeclared, and the
+                                // uploader misclassifies them as source
+                                // files (the LPTF upload failures). Re-
+                                // executing is cheap: real actions AC-hit.
+                                "EvalImportKey,BuildKey,EnsureProjectedArtifactKey,EnsureTransitiveSetProjectionKey".to_owned()
+                            })
                             .split(',')
                             .filter(|s| !s.is_empty())
                             .map(|s| s.trim().to_owned())
