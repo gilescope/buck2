@@ -1,0 +1,98 @@
+# Rolling release of the dice-persistence fork binaries (win/mac/linux).
+# The GH actions cache LRU-evicts rarely-touched entries (10 GB cap), which
+# silently downgraded fork-mode sweeps to release-mode twice in one day —
+# release assets are immune. Consumers (buck2-fixups sweeps) read
+# manifest.txt first and fetch the sha-stamped assets it names: the manifest
+# only advances after all three binaries are uploaded, so readers always see
+# a coherent set.
+name: release-dice
+on:
+  workflow_dispatch: {}
+  # workflow_dispatch only registers on the default branch; on this branch
+  # the working trigger is any push (a binary refresh is wanted then anyway).
+  push:
+    branches: [giles-dice-persistence]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-dice
+  cancel-in-progress: false
+
+env:
+  TAG: dice-persistence
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Ensure rolling release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 && exit 0
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "dice-persistence rolling binaries" \
+            --notes "buck2 fork binaries consumed by the buck2-fixups sweeps. manifest.txt names the current coherent asset set (sha-stamped)."
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            slug: win
+            bin: buck2.exe
+          - os: macos-15
+            slug: mac
+            bin: buck2
+          - os: ubuntu-latest
+            slug: linux
+            bin: buck2
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Build buck2
+        # rust-toolchain.toml pins the channel; rustup obeys.
+        run: cargo build --release --bin buck2
+
+      - name: Upload sha-stamped asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zstd -T0 -12 -f "target/release/${{ matrix.bin }}" \
+            -o "buck2-${{ matrix.slug }}-$GITHUB_SHA.zst"
+          gh release upload "$TAG" "buck2-${{ matrix.slug }}-$GITHUB_SHA.zst" \
+            -R "$GITHUB_REPOSITORY" --clobber
+
+  finalize:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Advance manifest, prune stale assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GITHUB_SHA" > manifest.txt
+          gh release upload "$TAG" manifest.txt -R "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+            grep -v "$GITHUB_SHA" | grep -vx 'manifest.txt' |
+            while read -r a; do
+              gh release delete-asset "$TAG" "$a" -R "$GITHUB_REPOSITORY" -y || true
+            done
