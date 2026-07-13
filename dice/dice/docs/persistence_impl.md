@@ -405,3 +405,29 @@ dirty propagation (the invalidation BFS has no edges to follow). Cost is bounded
 build re-accumulates rdeps as it revalidates nodes, same as a warm daemon after a clean
 invalidation. No action required for S1; revisit if profiling shows the first-build penalty
 is non-trivial.
+
+## Tail-memory attribution (2026-07-14, measured)
+
+Real 17.8k-command build (buck2-fixups fixups//third-party:, 32-core
+local exec, this fork + dice persistence active), `debug allocative` on
+the 2.9GB-resident daemon plus `debug hydration status`:
+
+- 812MB frozen Starlark heaps (`FrozenFrozenHeap` arenas — analysis
+  provider values; 17.3k AnalysisKey nodes ≈ 47KB each) + most of a
+  1.29GB untyped residual following the same shape.
+- ~400MB action/artifact graph (RegisteredAction 161MB, ArtifactData
+  106MB, BuildArtifactPath 91MB, artifact-group sets 29MB).
+- 117MB deferred materializer; 78MB TSet projections (45k nodes, tiny
+  each); 53MB dice graph shape (fine resident).
+
+In the hetero sweep this triples across three target platforms and
+peaks exactly at the build tail (9GB observed, swap exhausted, one
+runner OOM). Conclusion: the next lever is WATERMARK EVICTION DURING
+THE BUILD - AnalysisKey values (not snapshot-denied, storage already
+supports them) evicted coldest-first via a core-state message when
+resident bytes cross a threshold; Arc'd values keep in-flight readers
+safe, new readers hydrate from DiceStorage. The teardown-only
+`page_out` idle requirement is the artifact to remove; the side-effect
+denylist (BuildKey & co) is orthogonal and stays for snapshots.
+Action-value eviction (hydrate via the local RE AC on recompute, cache
+hits are ~40us) is the second-order follow-up for the ~400MB slice.
