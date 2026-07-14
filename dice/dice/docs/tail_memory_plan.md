@@ -85,7 +85,48 @@ what the field taught us:
 Knobs (all env, watcher armed only with `BUCK2_DICE_DB_PATH` set):
 `BUCK2_DICE_EVICT_HIGH` / `_LOW` (bytes, K/M/G suffix; LOW defaults to
 75% of HIGH), `_POLL_SECS` (10), `_CHUNK` (4096), `_ALLOW`
-(`AnalysisKey`). Acceptance lap on the rig still pending.
+(`AnalysisKey`).
+
+### Measured verdict (2026-07-14, local M-series specimen) — PARKED
+
+Two-leg analysis-only A/B (`//third-party:` default + t-linux platforms,
+34.6k AnalysisKeys stacked in one daemon, `fs_hash_crawler` watcher so
+legs actually stack; notify drops its cursor between commands and wipes
+the graph):
+
+- Baseline: peak RSS 4.46GB, 12:12 wall.
+- L0, single-sweep eviction: 17,305/34,635 AnalysisKeys paged out
+  (exactly leg 1's cold half - selection works), wall in noise, but
+  peak 5.99GB: the sweep's serialization transients (blob slots + WAL;
+  2.5GB serialized) stack on the still-resident graph. An OOM
+  accelerant at exactly the wrong moment.
+- L0, sub-batched (256/call): peak 7.15GB, leg 2 +3.5min - dribbled
+  eviction thrashes against cross-platform-shared values leg 2 reads
+  straight back.
+- Serialized AnalysisKey ≈ 145KB (2.5GB / 17.3k), ~3× the 47KB arena
+  estimate - page-out I/O is fatter than planned.
+
+The disqualifying fact is topology, not tuning: in the real hetero
+sweep each leg is its own daemon running ONE build command, and the
+transaction's SharedCache pins every value the running command
+computes. During the actual 9GB crest L0 has zero candidates. The
+multi-leg-per-daemon scenario it does address does not occur in CI.
+
+Status: code stays on this branch, dormant (env-gated, default off).
+The rig knob wiring was reverted. The CI crest's cheap fixes are
+operational (per-daemon memory caps, leg staggering); the deep fix is
+SharedCache release surgery - unfunded.
+
+## Where this leaves the ladder
+
+- L1: dead (see gate 2 - 6.4MB ceiling).
+- L0: parked (above).
+- L2 is the only live lever for the in-command crest: hash-consing
+  shrinks resident bytes even while values are pinned, which is what
+  pinning-proofs L0 could not do. It is also the largest fork-drift
+  item; whether it pays is now an explicit cost/benefit decision, not
+  a given. The 145KB/value serialized size and ≥3.3:1 redundancy floor
+  say the bytes exist; the maintenance bill says get a second opinion.
 
 ## L1 — freeze-time string interning (small starlark-rust change)
 
