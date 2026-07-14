@@ -49,7 +49,10 @@ pub fn process_stats() -> ProcessStats {
             stat.rss * 4096
         })
     } else {
-        None
+        // No procfs; sysinfo reads mach task_info / kvm. Callers sample at
+        // ~1Hz (snapshot) or slower (dice watermark evictor), so building a
+        // fresh System per call is fine.
+        rss_bytes_via_sysinfo()
     };
 
     ProcessStats {
@@ -58,6 +61,23 @@ pub fn process_stats() -> ProcessStats {
         user_cpu_us: Some(tv_to_micros(&usage.ru_utime)),
         system_cpu_us: Some(tv_to_micros(&usage.ru_stime)),
     }
+}
+
+/// Current resident bytes of this process on non-procfs unixes (macOS/BSD).
+#[cfg(unix)]
+fn rss_bytes_via_sysinfo() -> Option<u64> {
+    use sysinfo::ProcessRefreshKind;
+    use sysinfo::ProcessesToUpdate;
+    use sysinfo::System;
+
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    system.process(pid).map(|p| p.memory())
 }
 
 #[cfg(windows)]
@@ -178,7 +198,10 @@ mod tests {
             }
         }
         assert!(process_stats.max_rss_bytes.unwrap() > 0);
-        if cfg!(target_os = "linux") || cfg!(target_os = "windows") {
+        // linux: procfs; windows: K32GetProcessMemoryInfo; other unixes
+        // (macOS/BSD): sysinfo. The dice watermark evictor needs this Some
+        // everywhere it runs.
+        if cfg!(unix) || cfg!(windows) {
             let rss_bytes = process_stats.rss_bytes.unwrap();
             assert!(rss_bytes > 0);
         }
