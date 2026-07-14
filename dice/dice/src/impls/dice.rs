@@ -307,9 +307,22 @@ impl Dice {
         if !free_evictions.is_empty() {
             self.state_handle.evict_keys(free_evictions);
         }
-        storage
-            .page_out(to_serialize, &self.key_index, &self.state_handle)
-            .await?;
+        // Serialize in small sub-batches: page-out transiently buffers each
+        // value's serialized bytes (blob slots + backend WAL), and under
+        // pressure that transient must stay bounded - a single sweep paging
+        // out 2.5GB of values spiked RSS 3.3GB ABOVE the no-eviction
+        // baseline. Each page_out call flushes and releases its buffers, so
+        // the graph frees progressively as batches complete. Cost: shared
+        // subtrees re-serialize across batches (the store dedups them at
+        // rest) - CPU spent to keep the memory envelope flat.
+        const SERIALIZE_BATCH: usize = 256;
+        while !to_serialize.is_empty() {
+            let split = to_serialize.len().min(SERIALIZE_BATCH);
+            let batch: Vec<_> = to_serialize.drain(..split).collect();
+            storage
+                .page_out(batch, &self.key_index, &self.state_handle)
+                .await?;
+        }
         // Drain the core-state FIFO so every eviction message has been
         // processed before we report back (callers purge the allocator next).
         // Any async round-trip works as the barrier; this is the cheapest.
