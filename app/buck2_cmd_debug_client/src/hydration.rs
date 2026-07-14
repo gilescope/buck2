@@ -32,6 +32,9 @@ pub enum HydrationCommand {
     PageIn(PageInCommand),
     /// Summarize which DICE node values are resident in memory vs paged out.
     Status(StatusCommand),
+    /// Histogram of duplicate strings across all live frozen Starlark heaps
+    /// (sizes the freeze-time interning win).
+    DupStrings(DupStringsCommand),
 }
 
 #[derive(Debug, clap::Parser)]
@@ -43,12 +46,16 @@ pub struct PageInCommand;
 #[derive(Debug, clap::Parser)]
 pub struct StatusCommand;
 
+#[derive(Debug, clap::Parser)]
+pub struct DupStringsCommand;
+
 impl HydrationCommand {
     fn subcommand(&self) -> HydrationSubcommand {
         match self {
             HydrationCommand::PageOut(_) => HydrationSubcommand::PageOut,
             HydrationCommand::PageIn(_) => HydrationSubcommand::PageIn,
             HydrationCommand::Status(_) => HydrationSubcommand::Status,
+            HydrationCommand::DupStrings(_) => HydrationSubcommand::DupStrings,
         }
     }
 }

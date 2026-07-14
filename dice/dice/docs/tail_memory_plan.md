@@ -136,8 +136,17 @@ the arena in its on-disk format; arenas are mmap'd files.
 ## Order & measurement gates
 
 1. L0 now — removes the OOM cliff; gates: no-thrash + wall-time-noise.
+   [shipped 2026-07-14, see § L0 "As shipped"; acceptance lap pending]
 2. Instrument duplicate histograms (strings, whole values) on the
    specimen build — one allocative-style walk; sizes L1 vs L2.
+   [strings half shipped 2026-07-14: `buck2 debug hydration
+   dup-strings` — a global weak registry of frozen heaps in
+   starlark-rust (registered at freeze, pruned amortized) + a two-pass
+   FNV-content-hash walk (`starlark::values::dup_string_stats`).
+   Learned: a single FrozenHeap already interns its own strings, so
+   ALL duplication is cross-heap — precisely what L1 collapses. The
+   whole-value histogram is still open; its floor is the measured
+   ≥3.3:1 serialized redundancy.]
 3. L1 if strings dominate the histogram; L2 either way once L0 is
    stable. Re-run the specimen attribution after each layer.
 4. L3 design doc after L2's numbers are in.

@@ -57,7 +57,8 @@ impl ServerCommandTemplate for HydrationServerCommand {
             HydrationSubcommand::PageOut | HydrationSubcommand::PageIn => {
                 Some("hydration".to_owned())
             }
-            HydrationSubcommand::Status => None,
+            // Read-only reports.
+            HydrationSubcommand::Status | HydrationSubcommand::DupStrings => None,
         }
     }
 
@@ -142,7 +143,101 @@ impl ServerCommandTemplate for HydrationServerCommand {
                     summary: Some(format_status_summary(&status)),
                 })
             }
+            HydrationSubcommand::DupStrings => {
+                // O(all frozen-heap strings), seconds on a GB-scale daemon;
+                // run it on a blocking thread, not the command executor.
+                let summary = tokio::task::spawn_blocking(|| {
+                    let heaps = starlark::values::all_live_frozen_heaps();
+                    format_dup_strings_summary(&starlark::values::dup_string_stats(&heaps, 20))
+                })
+                .await
+                .map_err(|e| {
+                    buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Tier0)
+                })?;
+                Ok(buck2_cli_proto::HydrationResponse {
+                    summary: Some(summary),
+                })
+            }
         }
+    }
+}
+
+/// Render `dup_string_stats` for `buck2 debug hydration dup-strings`. The
+/// "duplicated" line is the freeze-time interning ceiling (L1 of the dice
+/// tail-memory plan): bytes reclaimed if every duplicate collapsed to one
+/// allocation. Payload bytes only - arena headers/alignment excluded, so the
+/// real win is somewhat larger.
+fn format_dup_strings_summary(stats: &starlark::values::DupStringStats) -> String {
+    let dup_strings = stats.total_strings - stats.distinct_strings;
+    let dup_bytes = stats.total_bytes - stats.distinct_bytes;
+    let pct = if stats.total_bytes > 0 {
+        (dup_bytes as f64) * 100.0 / (stats.total_bytes as f64)
+    } else {
+        0.0
+    };
+    let mut out = format!(
+        "Frozen-heap strings: {} heaps, {} strings, {} payload bytes\n\
+         distinct:   {} strings, {} bytes\n\
+         duplicated: {} copies, {} bytes ({:.1}% - the interning ceiling)\n",
+        stats.heaps,
+        stats.total_strings,
+        stats.total_bytes,
+        stats.distinct_strings,
+        stats.distinct_bytes,
+        dup_strings,
+        dup_bytes,
+        pct,
+    );
+    if !stats.top.is_empty() {
+        out.push_str(&format!(
+            "\n{:>12}  {:>8}  {:>8}  string\n",
+            "wasted", "copies", "len"
+        ));
+        for t in &stats.top {
+            let sample: String = t.sample.chars().take(60).collect();
+            out.push_str(&format!(
+                "{:>12}  {:>8}  {:>8}  {:?}\n",
+                t.wasted_bytes(),
+                t.copies,
+                t.len,
+                sample,
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use starlark::values::DupStringStat;
+    use starlark::values::DupStringStats;
+
+    use super::format_dup_strings_summary;
+
+    #[test]
+    fn dup_strings_summary_renders_totals_and_top_table() {
+        let stats = DupStringStats {
+            heaps: 3,
+            total_strings: 5,
+            total_bytes: 73,
+            distinct_strings: 3,
+            distinct_bytes: 37,
+            top: vec![DupStringStat {
+                sample: "shared-flag-string".to_owned(),
+                len: 18,
+                copies: 3,
+            }],
+        };
+        let s = format_dup_strings_summary(&stats);
+        assert!(s.contains("3 heaps, 5 strings, 73 payload bytes"));
+        assert!(s.contains("duplicated: 2 copies, 36 bytes (49.3%"));
+        assert!(s.contains("\"shared-flag-string\""));
+    }
+
+    #[test]
+    fn dup_strings_summary_empty_is_divide_by_zero_safe() {
+        let s = format_dup_strings_summary(&DupStringStats::default());
+        assert!(s.contains("(0.0%"));
     }
 }
 
