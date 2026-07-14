@@ -200,13 +200,20 @@ fn spawn_pressure_evictor(dice: std::sync::Weak<Dice>, high: u64, low: u64) {
         poll.as_secs()
     );
     tokio::spawn(async move {
+        // Back-off multiplier: above the watermark with NOTHING evictable
+        // (everything pinned by the running command), each poll still costs a
+        // graph walk on the core-state thread. Polling that state at full
+        // cadence measurably slowed an analysis-heavy build; nothing becomes
+        // evictable until a transaction drops, so ease off until one does.
+        let mut idle_backoff: u32 = 1;
         loop {
-            tokio::time::sleep(poll).await;
+            tokio::time::sleep(poll * idle_backoff).await;
             let Some(dice) = dice.upgrade() else { return };
             let Some(mut rss) = buck2_util::process_stats::process_stats().rss_bytes else {
                 continue;
             };
             if rss <= high {
+                idle_backoff = 1;
                 continue;
             }
             tracing::warn!(
@@ -232,7 +239,12 @@ fn spawn_pressure_evictor(dice: std::sync::Weak<Dice>, high: u64, low: u64) {
                 );
                 // Stop on target reached, candidates exhausted, or no forward
                 // progress (evictions pinned elsewhere / allocator holding).
-                if new_rss <= low || stats.selected == 0 || new_rss >= rss {
+                if stats.selected == 0 {
+                    idle_backoff = (idle_backoff * 2).min(8);
+                    break;
+                }
+                idle_backoff = 1;
+                if new_rss <= low || new_rss >= rss {
                     break;
                 }
                 rss = new_rss;

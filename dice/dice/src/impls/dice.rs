@@ -266,7 +266,24 @@ impl Dice {
             return Ok(PressureEvictStats::default());
         };
 
-        let mut candidates = self.state_handle.pressure_candidates().await;
+        // Scan the active transactions' caches off the core-state thread -
+        // they're concurrent structures, and the state thread is the build's
+        // bottleneck. Slight staleness is fine (see
+        // `CoreState::pressure_eviction_candidates`).
+        let caches = self.state_handle.active_caches().await;
+        let (referenced, pending) = tokio::task::spawn_blocking(move || {
+            let mut referenced = crate::HashSet::default();
+            let mut pending = crate::HashSet::default();
+            for cache in &caches {
+                cache.collect_referenced_keys(&mut referenced, &mut pending);
+            }
+            (referenced, pending)
+        })
+        .await?;
+        let mut candidates = self
+            .state_handle
+            .pressure_candidates(referenced, pending)
+            .await;
         candidates
             .retain(|c| allowed_key_types.contains(self.key_index.get(c.key).key_type_name()));
         let candidate_count = candidates.len();

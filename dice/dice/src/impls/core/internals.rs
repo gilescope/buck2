@@ -214,17 +214,30 @@ impl CoreState {
         }
     }
 
-    /// Nodes eligible for pressure eviction: occupied, hydrated, not referenced
-    /// by any active transaction's cache (the cache pins the value's `Arc`, so
-    /// evicting those frees nothing), and with no rdep task still pending (an
-    /// in-flight parent may read the value straight back - thrash).
-    pub(super) fn pressure_eviction_candidates(&self) -> Vec<PressureCandidate> {
-        let mut referenced = crate::HashSet::default();
-        let mut pending = crate::HashSet::default();
-        for (_refcount, cache) in self.version_tracker.currently_active() {
-            cache.collect_referenced_keys(&mut referenced, &mut pending);
-        }
+    /// The active transactions' caches, for off-state-thread inspection (the
+    /// cache structures are concurrent). Cheap: clones of `Arc`d handles.
+    pub(super) fn active_caches(&self) -> Vec<SharedCache> {
+        self.version_tracker
+            .currently_active()
+            .map(|(_refcount, cache)| cache.dupe())
+            .collect()
+    }
 
+    /// Nodes eligible for pressure eviction: occupied, hydrated, not in
+    /// `referenced` (keys referenced by an active transaction's cache - the
+    /// cache pins the value's `Arc`, so evicting those frees nothing), and
+    /// with no rdep in `pending` (an in-flight parent may read the value
+    /// straight back - thrash). The caller builds both sets off this thread
+    /// from `active_caches()` - scanning the caches here would stall the
+    /// core-state thread, which is the build's bottleneck (measured: +75%
+    /// wall on an analysis-heavy leg at a 5s poll). The sets may be slightly
+    /// stale; evicting a just-completed value is harmless (it stays pinned by
+    /// its cache until the transaction drops, then hydrates on demand).
+    pub(super) fn pressure_eviction_candidates(
+        &self,
+        referenced: &crate::HashSet<DiceKey>,
+        pending: &crate::HashSet<DiceKey>,
+    ) -> Vec<PressureCandidate> {
         let mut out = Vec::new();
         for (key, node) in &self.graph.nodes {
             let VersionedGraphNode::Occupied(occ) = node else {
@@ -519,15 +532,28 @@ mod tests {
         });
         cache.get(parent).testing_insert(pending_task);
 
+        // Mirror production: sets built off-thread from the active caches.
+        let collect = |core: &CoreState| {
+            let mut referenced = crate::HashSet::default();
+            let mut pending = crate::HashSet::default();
+            for c in core.active_caches() {
+                c.collect_referenced_keys(&mut referenced, &mut pending);
+            }
+            (referenced, pending)
+        };
+
+        let (referenced, pending) = collect(&core);
         assert!(
-            core.pressure_eviction_candidates().is_empty(),
+            core.pressure_eviction_candidates(&referenced, &pending)
+                .is_empty(),
             "pinned value and pending-rdep dep must both be excluded"
         );
 
         // Transaction gone: both become candidates.
         core.drop_ctx_at_version(v);
+        let (referenced, pending) = collect(&core);
         let mut keys: Vec<_> = core
-            .pressure_eviction_candidates()
+            .pressure_eviction_candidates(&referenced, &pending)
             .iter()
             .map(|c| c.key.index)
             .collect();

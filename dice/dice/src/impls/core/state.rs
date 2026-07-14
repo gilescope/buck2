@@ -27,6 +27,7 @@ use tokio::sync::oneshot::{self};
 use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
 use crate::arc::Arc;
+use crate::impls::cache::SharedCache;
 use crate::impls::core::graph::introspection::VersionedGraphIntrospectable;
 use crate::impls::core::graph::nodes::VersionedGraphNode;
 use crate::impls::core::graph::types::VersionedGraphKey;
@@ -283,13 +284,29 @@ impl CoreStateHandle {
         self.request(StateRequest::EvictKeys { keys })
     }
 
-    /// Collect nodes eligible for pressure eviction (hydrated, unpinned by any
-    /// active transaction, no pending rdep task).
+    /// The active transactions' caches, cloned for off-thread scanning.
+    pub(crate) fn active_caches(&self) -> impl Future<Output = Vec<SharedCache>> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(StateRequest::ActiveCaches { resp }, recv)
+    }
+
+    /// Collect nodes eligible for pressure eviction (hydrated, unpinned, no
+    /// pending rdep task). `referenced`/`pending` are prebuilt off-thread from
+    /// [`active_caches`](Self::active_caches).
     pub(crate) fn pressure_candidates(
         &self,
+        referenced: crate::HashSet<DiceKey>,
+        pending: crate::HashSet<DiceKey>,
     ) -> impl Future<Output = Vec<PressureCandidate>> + use<> {
         let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::PressureCandidates { resp }, recv)
+        self.call(
+            StateRequest::PressureCandidates {
+                referenced,
+                pending,
+                resp,
+            },
+            recv,
+        )
     }
 
     /// Replace the paged-out value at `key` with its hydrated form. Fire-and-forget;
@@ -449,8 +466,17 @@ pub(super) enum StateRequest {
         #[derivative(Debug = "ignore")]
         keys: Vec<(DiceKey, DataKey, DiceValidValue)>,
     },
+    /// The active transactions' caches, for off-thread scanning.
+    ActiveCaches {
+        #[derivative(Debug = "ignore")]
+        resp: Sender<Vec<SharedCache>>,
+    },
     /// Collect nodes eligible for pressure eviction.
     PressureCandidates {
+        #[derivative(Debug = "ignore")]
+        referenced: crate::HashSet<DiceKey>,
+        #[derivative(Debug = "ignore")]
+        pending: crate::HashSet<DiceKey>,
         #[derivative(Debug = "ignore")]
         resp: Sender<Vec<PressureCandidate>>,
     },

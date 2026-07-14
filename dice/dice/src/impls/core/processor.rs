@@ -149,8 +149,20 @@ impl StateProcessor {
             StateRequest::EvictKeys { keys } => {
                 self.state.evict_keys(keys);
             }
-            StateRequest::PressureCandidates { resp } => {
-                drop(resp.send(self.state.pressure_eviction_candidates()));
+            StateRequest::ActiveCaches { resp } => {
+                drop(resp.send(self.state.active_caches()));
+            }
+            StateRequest::PressureCandidates {
+                referenced,
+                pending,
+                resp,
+            } => {
+                drop(
+                    resp.send(
+                        self.state
+                            .pressure_eviction_candidates(&referenced, &pending),
+                    ),
+                );
             }
             StateRequest::Rehydrate { key, value } => {
                 self.state.rehydrate(key, value);
