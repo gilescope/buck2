@@ -149,6 +149,9 @@ impl StateProcessor {
             StateRequest::EvictKeys { keys } => {
                 self.state.evict_keys(keys);
             }
+            StateRequest::PressureCandidates { resp } => {
+                drop(resp.send(self.state.pressure_eviction_candidates()));
+            }
             StateRequest::Rehydrate { key, value } => {
                 self.state.rehydrate(key, value);
             }

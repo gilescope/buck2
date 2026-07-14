@@ -746,8 +746,18 @@ impl OccupiedGraphNode {
             .intersect_range(VersionRange::bounded(VersionNumber::ZERO, v))
     }
 
-    fn rdeps(&self) -> impl Iterator<Item = DiceKey> {
+    pub(crate) fn rdeps(&self) -> impl Iterator<Item = DiceKey> {
         self.metadata.rdeps.iter()
+    }
+
+    /// Begin of the most recent verified range - the closest thing the graph
+    /// tracks to "when this value was last (re)computed". Used as the coldness
+    /// rank for pressure eviction; never-verified nodes rank coldest.
+    pub(crate) fn last_verified_begin(&self) -> VersionNumber {
+        self.metadata
+            .verified_ranges
+            .last()
+            .map_or(VersionNumber::ZERO, |r| r.begin())
     }
 
     pub(crate) fn deps(&self) -> &Arc<SeriesParallelDeps> {

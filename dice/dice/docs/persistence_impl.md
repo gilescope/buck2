@@ -422,12 +422,14 @@ the 2.9GB-resident daemon plus `debug hydration status`:
 
 In the hetero sweep this triples across three target platforms and
 peaks exactly at the build tail (9GB observed, swap exhausted, one
-runner OOM). Conclusion: the next lever is WATERMARK EVICTION DURING
-THE BUILD - AnalysisKey values (not snapshot-denied, storage already
-supports them) evicted coldest-first via a core-state message when
-resident bytes cross a threshold; Arc'd values keep in-flight readers
-safe, new readers hydrate from DiceStorage. The teardown-only
-`page_out` idle requirement is the artifact to remove; the side-effect
-denylist (BuildKey & co) is orthogonal and stays for snapshots.
-Action-value eviction (hydrate via the local RE AC on recompute, cache
-hits are ~40us) is the second-order follow-up for the ~400MB slice.
+runner OOM). The lever - WATERMARK EVICTION DURING THE BUILD - shipped
+2026-07-14 as `Dice::evict_under_pressure` plus a daemon watcher (see
+`tail_memory_plan.md` § L0 "As shipped"): AnalysisKey values evicted
+coldest-first via core-state messages when RSS crosses the high
+watermark; Arc'd values keep in-flight readers safe, new readers
+hydrate from DiceStorage. `page_out` keeps its idle-only contract
+(eviction is an additive path, not a relaxation of it); the
+side-effect denylist (BuildKey & co) is orthogonal and stays for
+snapshots. Action-value eviction (hydrate via the local RE AC on
+recompute, cache hits are ~40us) is the second-order follow-up for
+the ~400MB slice.

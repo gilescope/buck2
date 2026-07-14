@@ -20,6 +20,7 @@ use dice_error::result::CancellationReason;
 use dupe::Dupe;
 use lock_free_hashtable::sharded::ShardedLockFreeRawTable;
 
+use crate::HashSet;
 use crate::arc::Arc;
 use crate::impls::key::DiceKey;
 use crate::impls::task::dice::DiceTask;
@@ -137,6 +138,27 @@ impl SharedCache {
 
     pub(crate) fn active_tasks_count(&self) -> usize {
         self.data.storage.len() + self.data.completed.len()
+    }
+
+    /// Pressure-eviction support: every key this cache references (pending or
+    /// completed) goes into `referenced` - the cache pins completed values for
+    /// the transaction's lifetime, so evicting them from the graph frees
+    /// nothing. Keys whose task is still pending additionally go into
+    /// `pending` - their dep reads may be imminent.
+    pub(crate) fn collect_referenced_keys(
+        &self,
+        referenced: &mut HashSet<DiceKey>,
+        pending: &mut HashSet<DiceKey>,
+    ) {
+        for entry in self.data.storage.iter() {
+            referenced.insert(*entry.key());
+            if entry.value().is_pending() {
+                pending.insert(*entry.key());
+            }
+        }
+        for task in self.data.completed.iter() {
+            referenced.insert(task.key);
+        }
     }
 
     /// This function gets the termination observer for all running tasks when transaction is

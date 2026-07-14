@@ -60,6 +60,18 @@ pub(crate) struct PagableStatusRaw {
     pub(crate) paged_out: Vec<DiceKey>,
 }
 
+/// One node eligible for pressure eviction, from
+/// `CoreState::pressure_eviction_candidates`. The value is an `Arc` dupe; the
+/// caller sizes/serializes it off the state thread.
+pub(crate) struct PressureCandidate {
+    pub(crate) key: DiceKey,
+    pub(crate) value: DiceValidValue,
+    /// `Some` = bytes already on disk; eviction needs no re-serialization.
+    pub(crate) data_key: Option<DataKey>,
+    /// Coldness rank (older = colder); see `OccupiedGraphNode::last_verified_begin`.
+    pub(crate) last_verified_begin: VersionNumber,
+}
+
 impl CoreState {
     pub(super) fn new() -> Self {
         Self {
@@ -185,12 +197,56 @@ impl CoreState {
 
     /// Evict in-memory values for the given nodes, marking them as paged out
     /// with their `DataKey`s. Skips nodes that are missing, vacant, or injected.
-    pub(super) fn evict_keys(&mut self, keys: Vec<(DiceKey, DataKey)>) {
-        for (key, data_key) in keys {
+    ///
+    /// Checked: each entry carries the value that was serialized, and the node
+    /// is only paged out if it still holds that exact value (pointer identity).
+    /// Pressure eviction runs while builds are live, so a node can be
+    /// recomputed between serialization and this message arriving - blindly
+    /// paging out would pair the new value's node with stale on-disk bytes.
+    pub(super) fn evict_keys(&mut self, keys: Vec<(DiceKey, DataKey, DiceValidValue)>) {
+        for (key, data_key, serialized) in keys {
             if let Some(VersionedGraphNode::Occupied(occ)) = self.graph.nodes.get_mut(&key) {
-                occ.set_paged_out(data_key);
+                match occ.val().as_hydrated() {
+                    Some(current) if current.ptr_eq(&serialized) => occ.set_paged_out(data_key),
+                    _ => {}
+                }
             }
         }
+    }
+
+    /// Nodes eligible for pressure eviction: occupied, hydrated, not referenced
+    /// by any active transaction's cache (the cache pins the value's `Arc`, so
+    /// evicting those frees nothing), and with no rdep task still pending (an
+    /// in-flight parent may read the value straight back - thrash).
+    pub(super) fn pressure_eviction_candidates(&self) -> Vec<PressureCandidate> {
+        let mut referenced = crate::HashSet::default();
+        let mut pending = crate::HashSet::default();
+        for (_refcount, cache) in self.version_tracker.currently_active() {
+            cache.collect_referenced_keys(&mut referenced, &mut pending);
+        }
+
+        let mut out = Vec::new();
+        for (key, node) in &self.graph.nodes {
+            let VersionedGraphNode::Occupied(occ) = node else {
+                continue;
+            };
+            let Some(value) = occ.val().as_hydrated() else {
+                continue;
+            };
+            if referenced.contains(key) {
+                continue;
+            }
+            if occ.rdeps().any(|r| pending.contains(&r)) {
+                continue;
+            }
+            out.push(PressureCandidate {
+                key: *key,
+                value: value.dupe(),
+                data_key: occ.val().data_key(),
+                last_verified_begin: occ.last_verified_begin(),
+            });
+        }
+        out
     }
 
     /// Persist support: extract every node's snapshot metadata. Runs on the
@@ -380,6 +436,104 @@ mod tests {
     use crate::impls::value::TrackedInvalidationPaths;
     use crate::testing_helpers::make_completed_task;
     use crate::versions::VersionNumber;
+
+    /// Checked eviction: a node holding a different value (recomputed since
+    /// serialization) must not be paged out against the stale bytes.
+    #[test]
+    fn evict_keys_skips_nodes_holding_a_different_value() {
+        let mut core = CoreState::new();
+        let v = VersionNumber::new(0);
+        let (epoch, _ctx) = core.ctx_at_version(v);
+        let key = DiceKey { index: 0 };
+        let value = DiceValidValue::testing_new(DiceKeyValue::<K>::new(1));
+        core.update_computed(
+            VersionedGraphKey::new(v, key),
+            epoch,
+            StorageType::Normal,
+            value.dupe(),
+            ValueReusable::EqualityBased,
+            Arc::new(SeriesParallelDeps::None),
+            TrackedInvalidationPaths::clean(),
+        )
+        .unwrap();
+
+        // Same contents, different allocation - models a recompute that landed
+        // between serialization and the evict message.
+        let stale = DiceValidValue::testing_new(DiceKeyValue::<K>::new(1));
+        core.evict_keys(vec![(key, pagable::DataKey(1), stale)]);
+        let status = core.pagable_status();
+        assert_eq!(
+            (status.resident.len(), status.paged_out.len()),
+            (1, 0),
+            "stale-value eviction must be skipped"
+        );
+
+        core.evict_keys(vec![(key, pagable::DataKey(1), value)]);
+        let status = core.pagable_status();
+        assert_eq!(
+            (status.resident.len(), status.paged_out.len()),
+            (0, 1),
+            "matching-value eviction pages out"
+        );
+    }
+
+    /// Pressure candidates exclude values referenced by an active
+    /// transaction's cache and values whose rdep has a pending task.
+    #[tokio::test]
+    async fn pressure_candidates_exclude_pinned_and_pending_rdeps() {
+        let mut core = CoreState::new();
+        let v = VersionNumber::new(0);
+        let (epoch, cache) = core.ctx_at_version(v);
+        let dep = DiceKey { index: 1 };
+        let parent = DiceKey { index: 2 };
+        core.update_computed(
+            VersionedGraphKey::new(v, dep),
+            epoch,
+            StorageType::Normal,
+            DiceValidValue::testing_new(DiceKeyValue::<K>::new(1)),
+            ValueReusable::EqualityBased,
+            Arc::new(SeriesParallelDeps::None),
+            TrackedInvalidationPaths::clean(),
+        )
+        .unwrap();
+        // Records the rdep edge dep -> parent.
+        core.update_computed(
+            VersionedGraphKey::new(v, parent),
+            epoch,
+            StorageType::Normal,
+            DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)),
+            ValueReusable::EqualityBased,
+            Arc::new(SeriesParallelDeps::serial_from_vec(vec![dep])),
+            TrackedInvalidationPaths::clean(),
+        )
+        .unwrap();
+
+        // A pending task for `parent` in the active cache: `parent` is
+        // referenced, and `dep` has a pending rdep - both must be excluded.
+        let pending_task = spawn_dice_task(parent, &TokioSpawner, &(), |handle| {
+            async move {
+                let _handle = handle;
+                futures::future::pending().await
+            }
+            .boxed()
+        });
+        cache.get(parent).testing_insert(pending_task);
+
+        assert!(
+            core.pressure_eviction_candidates().is_empty(),
+            "pinned value and pending-rdep dep must both be excluded"
+        );
+
+        // Transaction gone: both become candidates.
+        core.drop_ctx_at_version(v);
+        let mut keys: Vec<_> = core
+            .pressure_eviction_candidates()
+            .iter()
+            .map(|c| c.key.index)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![1, 2]);
+    }
 
     #[test]
     fn update_state_gets_next_version() {

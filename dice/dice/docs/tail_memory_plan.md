@@ -1,8 +1,8 @@
 # Tail-memory plan: bounding and shrinking frozen analysis heaps
 
-Status: planned. Attribution + rates measured 2026-07-14 (see
-`persistence_impl.md` § "Tail-memory attribution"). Owner branch:
-`giles-dice-persistence`.
+Status: L0 implemented 2026-07-14 (see § L0 "As shipped"); L1-L3 planned.
+Attribution + rates measured 2026-07-14 (see `persistence_impl.md`
+§ "Tail-memory attribution"). Owner branch: `giles-dice-persistence`.
 
 ## Problem
 
@@ -36,22 +36,56 @@ by pointer only for values passed BETWEEN modules).
 Bound RSS; ends the OOM class. No new serialization code: S1-S3's
 DiceStorage page-out/page-in is the mechanism.
 
-- Remove `Dice::page_out`'s idle-only restriction for a new targeted
-  entry point: `evict_under_pressure(target_bytes)` runs as a
-  core-state-thread message (all graph mutations already serialize
-  there — no new locking).
+- A new targeted entry point with no idle requirement (`page_out`
+  itself keeps its idle-only contract):
+  `evict_under_pressure(max_values, allowed_key_types)` — candidate
+  collection and eviction run as core-state-thread messages (all graph
+  mutations already serialize there — no new locking).
 - Eviction policy: allowed key types only (AnalysisKey first; the
   snapshot side-effect denylist — BuildKey & co — is orthogonal and
   untouched: it guards CROSS-PROCESS hydration, not in-process
-  eviction). Coldest-first; NEVER evict a value with uncomputed rdeps.
-- Trigger: watermark check on the existing memory tracker (or
-  /proc/self RSS) every N seconds; hysteresis — trigger at H, evict
-  down to L (e.g. 60% / 45% of box RAM) to prevent thrash.
+  eviction). Coldest-first; skip values pinned by an active
+  transaction's cache or with a pending rdep task (see "As shipped").
+- Trigger: watermark check on /proc/self RSS every N seconds;
+  hysteresis — trigger at H, evict down to L (default L = 75% of H) to
+  prevent thrash.
 - Values are immutable post-freeze: cache serialized bytes beside the
   arena so re-eviction of a hydrated value writes nothing.
 - Acceptance: hetero sweep lap with rig in scope holds daemon RSS
   under the watermark; STARVED/vitals lines show no thrash (hydrations
   per minute bounded); wall time within noise of baseline.
+
+### As shipped (2026-07-14)
+
+`Dice::evict_under_pressure(max_values, allowed_key_types)` + a daemon
+watcher in `configure_dice.rs`. Deviations from the sketch above, and
+what the field taught us:
+
+- **Count-paced, not `target_bytes`.** Per-value resident size is not
+  measurable pre-L2: values live behind `Arc`s and share arenas, so
+  allocative's unique-ownership walk reports 0 and serialized size
+  mis-states resident bytes. The watcher is the controller instead:
+  evict a chunk (`BUCK2_DICE_EVICT_CHUNK`, default 4096), purge
+  jemalloc, re-measure RSS, repeat until under the low watermark.
+- **Pinned filter, not just rdeps.** A transaction's `SharedCache`
+  retains every completed value for the transaction's lifetime, so
+  evicting a node referenced by any active version frees nothing.
+  Candidates exclude keys in any active cache (pending or completed);
+  the uncomputed-rdeps guard additionally skips values whose rdep task
+  is pending. Net effect on the hetero sweep: legs 1..n-1 are evictable
+  while leg n runs - RSS bounded at steady + one leg.
+- **Checked eviction (TOCTOU).** Mid-build, a node can be recomputed
+  between serialization and the evict message; blind `set_paged_out`
+  would pair the new value with stale bytes. Evict messages carry the
+  serialized value; the state thread pages out only on pointer match.
+- Coldness rank: begin of the last verified range (DICE tracks no
+  access times); re-eviction of a hydrated value reuses its `DataKey`
+  (no re-serialization), as planned.
+
+Knobs (all env, watcher armed only with `BUCK2_DICE_DB_PATH` set):
+`BUCK2_DICE_EVICT_HIGH` / `_LOW` (bytes, K/M/G suffix; LOW defaults to
+75% of HIGH), `_POLL_SECS` (10), `_CHUNK` (4096), `_ALLOW`
+(`AnalysisKey`). Acceptance lap on the rig still pending.
 
 ## L1 — freeze-time string interning (small starlark-rust change)
 

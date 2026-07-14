@@ -140,5 +140,129 @@ pub async fn configure_dice_for_buck(
         }
     }
 
+    // L0 watermark eviction: bound daemon RSS by paging out cold DICE values
+    // mid-build. Opt-in via BUCK2_DICE_EVICT_HIGH (requires pagable storage).
+    if std::env::var("BUCK2_DICE_DB_PATH").is_ok()
+        && let Some((high, low)) = dice_evict_watermarks_env()
+    {
+        spawn_pressure_evictor(Arc::downgrade(&dice), high, low);
+    }
+
     Ok(dice)
+}
+
+/// Watermark-eviction knobs (L0 of the dice tail-memory plan).
+/// `BUCK2_DICE_EVICT_HIGH` / `BUCK2_DICE_EVICT_LOW` take bytes with an
+/// optional K/M/G suffix (e.g. `6G`). LOW defaults to 75% of HIGH. Absolute
+/// bytes, not fractions of RAM: the launcher (CI driver) knows the box.
+fn dice_evict_watermarks_env() -> Option<(u64, u64)> {
+    let high = parse_byte_size(&std::env::var("BUCK2_DICE_EVICT_HIGH").ok()?)?;
+    let low = std::env::var("BUCK2_DICE_EVICT_LOW")
+        .ok()
+        .and_then(|v| parse_byte_size(&v))
+        .unwrap_or(high / 4 * 3);
+    if low >= high {
+        tracing::warn!("BUCK2_DICE_EVICT_LOW >= BUCK2_DICE_EVICT_HIGH; eviction disabled");
+        return None;
+    }
+    Some((high, low))
+}
+
+fn parse_byte_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.as_bytes().last()? {
+        b'K' | b'k' => (&s[..s.len() - 1], 1u64 << 10),
+        b'M' | b'm' => (&s[..s.len() - 1], 1 << 20),
+        b'G' | b'g' => (&s[..s.len() - 1], 1 << 30),
+        _ => (s, 1),
+    };
+    num.trim().parse::<u64>().ok()?.checked_mul(mult)
+}
+
+/// Poll RSS; above `high`, evict cold values chunk by chunk until below `low`
+/// (hysteresis - the gap prevents trigger/evict thrash at the boundary).
+/// Eviction is count-paced with RSS as the controller's ground truth: per-value
+/// resident size is not reliably measurable (values share arenas), so each
+/// round evicts a chunk, purges the allocator, and re-measures.
+fn spawn_pressure_evictor(dice: std::sync::Weak<Dice>, high: u64, low: u64) {
+    let poll = std::time::Duration::from_secs(env_u64("BUCK2_DICE_EVICT_POLL_SECS", 10));
+    let chunk = usize::try_from(env_u64("BUCK2_DICE_EVICT_CHUNK", 4096)).unwrap_or(4096);
+    // AnalysisKey values dominate the build-tail heap (see
+    // dice/docs/tail_memory_plan.md); other key types opt in via env.
+    let allowed: std::collections::HashSet<String> = std::env::var("BUCK2_DICE_EVICT_ALLOW")
+        .unwrap_or_else(|_| "AnalysisKey".to_owned())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_owned())
+        .collect();
+    tracing::info!(
+        "dice pressure evictor armed: high {high}B, low {low}B, poll {}s, chunk {chunk}, allow {allowed:?}",
+        poll.as_secs()
+    );
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(poll).await;
+            let Some(dice) = dice.upgrade() else { return };
+            let Some(mut rss) = buck2_util::process_stats::process_stats().rss_bytes else {
+                continue;
+            };
+            if rss <= high {
+                continue;
+            }
+            tracing::warn!(
+                "dice pressure: rss {rss}B > high watermark {high}B; evicting to {low}B"
+            );
+            loop {
+                let stats = match dice.evict_under_pressure(chunk, &allowed).await {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        tracing::warn!("dice pressure eviction failed: {e:#}");
+                        break;
+                    }
+                };
+                let _ = buck2_common::memory::purge_jemalloc();
+                let new_rss = buck2_util::process_stats::process_stats()
+                    .rss_bytes
+                    .unwrap_or(rss);
+                tracing::info!(
+                    "dice pressure: evicted {} of {} candidates ({} pre-serialized); rss {rss}B -> {new_rss}B",
+                    stats.selected,
+                    stats.candidates,
+                    stats.already_serialized,
+                );
+                // Stop on target reached, candidates exhausted, or no forward
+                // progress (evictions pinned elsewhere / allocator holding).
+                if new_rss <= low || stats.selected == 0 || new_rss >= rss {
+                    break;
+                }
+                rss = new_rss;
+            }
+        }
+    });
+}
+
+fn env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_size;
+
+    #[test]
+    fn parse_byte_size_suffixes() {
+        assert_eq!(parse_byte_size("1024"), Some(1024));
+        assert_eq!(parse_byte_size("4K"), Some(4096));
+        assert_eq!(parse_byte_size("2m"), Some(2 << 20));
+        assert_eq!(parse_byte_size("6G"), Some(6 << 30));
+        assert_eq!(parse_byte_size(" 6 G "), Some(6 << 30));
+        assert_eq!(parse_byte_size(""), None);
+        assert_eq!(parse_byte_size("G"), None);
+        assert_eq!(parse_byte_size("nope"), None);
+        // Overflow must not wrap.
+        assert_eq!(parse_byte_size("999999999999999999G"), None);
+    }
 }

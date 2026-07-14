@@ -52,6 +52,18 @@ impl DiceValidValue {
     pub(crate) fn from_arc(arc: std::sync::Arc<dyn DiceValueDyn>) -> Self {
         Self(arc)
     }
+
+    /// Pointer identity of the underlying allocation. Checked eviction uses
+    /// this to detect a node recomputed between value serialization and the
+    /// evict message reaching the state thread (evicting then would pair the
+    /// new value's node with stale on-disk bytes). Thin-pointer compare: two
+    /// handles to one allocation are the same value regardless of vtable.
+    pub(crate) fn ptr_eq(&self, other: &DiceValidValue) -> bool {
+        std::ptr::addr_eq(
+            std::sync::Arc::as_ptr(&self.0),
+            std::sync::Arc::as_ptr(&other.0),
+        )
+    }
 }
 
 /// Type erased value that may be transient, or whose dependencies are transient

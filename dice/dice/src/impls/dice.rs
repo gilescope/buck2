@@ -235,6 +235,71 @@ impl Dice {
             .await
     }
 
+    /// Targeted eviction for memory pressure: page out cold values while
+    /// builds may still be running - unlike [`Dice::page_out`], no idle
+    /// requirement. Later lookups of an evicted key hydrate on demand.
+    ///
+    /// Candidates exclude values referenced by any active transaction's cache
+    /// (the cache pins the `Arc`, so evicting those frees nothing) and values
+    /// with an rdep task still pending (likely read straight back - thrash).
+    /// Coldest first, ranked by last-verified version. Only key types named in
+    /// `allowed_key_types` (matched against `Key::key_type_name`, e.g.
+    /// `"AnalysisKey"`) are eligible.
+    ///
+    /// `max_values` bounds how many values this call evicts. It is a count,
+    /// not bytes, deliberately: per-value resident size is not reliably
+    /// measurable before L2 (values share arenas behind `Arc`s, so both
+    /// unique-ownership walks and serialized size mis-state what an eviction
+    /// frees). The caller's watermark loop is the controller - evict a chunk,
+    /// purge the allocator, re-measure RSS, repeat until under the low
+    /// watermark. Values already serialized by an earlier page-out are
+    /// evicted without re-serialization.
+    ///
+    /// All evictions have been applied on the core-state thread by the time
+    /// this returns. No-op without pagable storage.
+    pub async fn evict_under_pressure(
+        self: &Arc<Self>,
+        max_values: usize,
+        allowed_key_types: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<PressureEvictStats> {
+        let Some(storage) = self.pagable_storage.as_ref() else {
+            return Ok(PressureEvictStats::default());
+        };
+
+        let mut candidates = self.state_handle.pressure_candidates().await;
+        candidates
+            .retain(|c| allowed_key_types.contains(self.key_index.get(c.key).key_type_name()));
+        let candidate_count = candidates.len();
+        candidates.sort_by_key(|c| c.last_verified_begin);
+        candidates.truncate(max_values);
+
+        let mut free_evictions = Vec::new();
+        let mut to_serialize = Vec::new();
+        for c in candidates {
+            match c.data_key {
+                Some(data_key) => free_evictions.push((c.key, data_key, c.value)),
+                None => to_serialize.push((c.key, c.value)),
+            }
+        }
+
+        let stats = PressureEvictStats {
+            candidates: candidate_count,
+            selected: free_evictions.len() + to_serialize.len(),
+            already_serialized: free_evictions.len(),
+        };
+        if !free_evictions.is_empty() {
+            self.state_handle.evict_keys(free_evictions);
+        }
+        storage
+            .page_out(to_serialize, &self.key_index, &self.state_handle)
+            .await?;
+        // Drain the core-state FIFO so every eviction message has been
+        // processed before we report back (callers purge the allocator next).
+        // Any async round-trip works as the barrier; this is the cheapest.
+        let _ = self.state_handle.current_version().await;
+        Ok(stats)
+    }
+
     /// Page in (rehydrate) all paged-out `OccupiedGraphNode` values from the
     /// configured `DiceStorage`, used for debugging.
     ///
@@ -302,6 +367,21 @@ impl Dice {
             by_type,
         }
     }
+}
+
+/// Result summary of [`Dice::evict_under_pressure`]. Counts are of *attempted*
+/// evictions - a value recomputed mid-flight is skipped by the checked
+/// eviction on the state thread and stays resident. RSS is the ground truth;
+/// these numbers only steer the caller's hysteresis loop.
+#[derive(Debug, Default)]
+pub struct PressureEvictStats {
+    /// Eligible cold values before the byte target cut selection off.
+    pub candidates: usize,
+    /// Values selected for eviction this call.
+    pub selected: usize,
+    /// Of `selected`, how many already had bytes on disk and were evicted
+    /// without re-serialization.
+    pub already_serialized: usize,
 }
 
 /// Summary of how many DICE node values are resident in memory vs paged out to

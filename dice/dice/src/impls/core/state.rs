@@ -34,6 +34,7 @@ use crate::impls::core::graph::types::VersionedGraphResult;
 use crate::impls::core::graph::types::VersionedGraphResultMismatch;
 use crate::impls::core::internals::CoreState;
 use crate::impls::core::internals::PagableStatusRaw;
+use crate::impls::core::internals::PressureCandidate;
 use crate::impls::core::processor::StateProcessor;
 use crate::impls::core::versions::VersionEpoch;
 use crate::impls::core::versions::introspection::VersionIntrospectable;
@@ -275,9 +276,20 @@ impl CoreStateHandle {
 
     /// Evict in-memory values for the given nodes, marking them as paged out.
     /// Fire-and-forget; any subsequent state requests are guaranteed to see
-    /// the evicted state because state requests are processed FIFO.
-    pub(crate) fn evict_keys(&self, keys: Vec<(DiceKey, DataKey)>) {
+    /// the evicted state because state requests are processed FIFO. Each entry
+    /// carries the serialized value; a node holding a different value by the
+    /// time the message lands is skipped (see `CoreState::evict_keys`).
+    pub(crate) fn evict_keys(&self, keys: Vec<(DiceKey, DataKey, DiceValidValue)>) {
         self.request(StateRequest::EvictKeys { keys })
+    }
+
+    /// Collect nodes eligible for pressure eviction (hydrated, unpinned by any
+    /// active transaction, no pending rdep task).
+    pub(crate) fn pressure_candidates(
+        &self,
+    ) -> impl Future<Output = Vec<PressureCandidate>> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(StateRequest::PressureCandidates { resp }, recv)
     }
 
     /// Replace the paged-out value at `key` with its hydrated form. Fire-and-forget;
@@ -431,8 +443,17 @@ pub(super) enum StateRequest {
     KeysToPageOut {
         resp: Sender<Vec<(DiceKey, DiceValidValue)>>,
     },
-    /// Mark nodes as paged out, dropping their in-memory values.
-    EvictKeys { keys: Vec<(DiceKey, DataKey)> },
+    /// Mark nodes as paged out, dropping their in-memory values (checked
+    /// against the serialized value's identity).
+    EvictKeys {
+        #[derivative(Debug = "ignore")]
+        keys: Vec<(DiceKey, DataKey, DiceValidValue)>,
+    },
+    /// Collect nodes eligible for pressure eviction.
+    PressureCandidates {
+        #[derivative(Debug = "ignore")]
+        resp: Sender<Vec<PressureCandidate>>,
+    },
     /// Replace the paged-out value at `key` with its hydrated form.
     Rehydrate {
         key: DiceKey,

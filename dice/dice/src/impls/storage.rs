@@ -15,7 +15,8 @@
 //! Serialization is performed via the bridging methods on [`DiceKeyDyn`] /
 //! [`DiceProjectionDyn`], which delegate to each concrete `Key`'s `value_serialize()`.
 //!
-//! See `Dice::page_out` for the user-facing entry point.
+//! See `Dice::page_out` (idle, whole-graph) and `Dice::evict_under_pressure`
+//! (mid-build, targeted) for the user-facing entry points.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -174,8 +175,11 @@ impl DiceStorage {
         const EVICT_BATCH_SIZE: usize = 1000;
         let mut pending_evictions = Vec::with_capacity(EVICT_BATCH_SIZE);
         for (dice_key, key_dyn, value) in items {
-            if let Some(data_key) = self.page_out_value(&key_dyn, value, finished)? {
-                pending_evictions.push((dice_key, data_key));
+            if let Some(data_key) = self.page_out_value(&key_dyn, value.dupe(), finished)? {
+                // The value rides along so the state thread can skip nodes
+                // recomputed since serialization (pressure eviction runs
+                // while builds are live).
+                pending_evictions.push((dice_key, data_key, value));
                 if pending_evictions.len() >= EVICT_BATCH_SIZE {
                     state_handle.evict_keys(std::mem::replace(
                         &mut pending_evictions,
