@@ -17,9 +17,14 @@
 use std::sync::Arc as StdArc;
 
 use dupe::Dupe;
+use futures::Future;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::Sender;
 
 use crate::core::graph::nodes::VersionedGraphNode;
 use crate::core::internals::CoreState;
+use crate::core::state::CoreStateHandle;
+use crate::core::state::StateRequest;
 use crate::dice::Dice;
 use crate::epoch::cache::SharedCache;
 use crate::key::DiceKey;
@@ -187,5 +192,63 @@ impl CoreState {
                 })
             })
             .collect()
+    }
+}
+
+/// The fork's core-state requests, carried as a single [`StateRequest`]
+/// variant so `state.rs` and the processor's match each grow one line rather
+/// than one per request.
+pub(crate) enum PressureRequest {
+    /// The active transactions' caches, for off-thread scanning.
+    ActiveCaches { resp: Sender<Vec<SharedCache>> },
+    /// Collect nodes eligible for pressure eviction.
+    Candidates {
+        referenced: crate::HashSet<DiceKey>,
+        pending: crate::HashSet<DiceKey>,
+        resp: Sender<Vec<PressureCandidate>>,
+    },
+}
+
+impl PressureRequest {
+    /// Run on the core-state thread. Dropped senders mean the caller went away.
+    pub(crate) fn handle(self, state: &mut CoreState) {
+        match self {
+            PressureRequest::ActiveCaches { resp } => drop(resp.send(state.active_caches())),
+            PressureRequest::Candidates {
+                referenced,
+                pending,
+                resp,
+            } => drop(resp.send(state.pressure_eviction_candidates(&referenced, &pending))),
+        }
+    }
+}
+
+impl CoreStateHandle {
+    /// The active transactions' caches, cloned for off-thread scanning.
+    pub(crate) fn active_caches(&self) -> impl Future<Output = Vec<SharedCache>> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(
+            StateRequest::Pressure(PressureRequest::ActiveCaches { resp }),
+            recv,
+        )
+    }
+
+    /// Collect nodes eligible for pressure eviction (hydrated, unpinned, no
+    /// pending rdep task). `referenced`/`pending` are prebuilt off-thread from
+    /// [`active_caches`](Self::active_caches).
+    pub(crate) fn pressure_candidates(
+        &self,
+        referenced: crate::HashSet<DiceKey>,
+        pending: crate::HashSet<DiceKey>,
+    ) -> impl Future<Output = Vec<PressureCandidate>> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(
+            StateRequest::Pressure(PressureRequest::Candidates {
+                referenced,
+                pending,
+                resp,
+            }),
+            recv,
+        )
     }
 }

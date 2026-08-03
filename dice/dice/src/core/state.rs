@@ -26,7 +26,6 @@ use crate::api::key::InvalidationSourcePriority;
 use crate::api::storage_type::StorageType;
 use crate::arc::Arc;
 use crate::core::graph::introspection::VersionedGraphIntrospectable;
-use crate::core::graph::nodes::VersionedGraphNode;
 use crate::core::graph::types::VersionedGraphKey;
 use crate::core::graph::types::VersionedGraphResult;
 use crate::core::graph::types::VersionedGraphResultMismatch;
@@ -37,14 +36,13 @@ use crate::core::versions::VersionEpoch;
 use crate::core::versions::introspection::VersionIntrospectable;
 use crate::deps::graph::SeriesParallelDeps;
 use crate::dice::PagableNodeCounts;
-use crate::epoch::cache::SharedCache;
 use crate::epoch::cache::TransactionResult;
 use crate::epoch::evaluator::VersionEpochState;
 use crate::epoch::task::dice::DiceTask;
 use crate::key::DiceKey;
 use crate::metrics::Metrics;
-use crate::persist::PersistNodeExtract;
-use crate::pressure::PressureCandidate;
+use crate::persist_ext::PersistRequest;
+use crate::pressure::PressureRequest;
 use crate::updater::ActiveTransactionGuard;
 use crate::updater::ChangeType;
 use crate::value::DiceComputedValue;
@@ -123,7 +121,7 @@ impl CoreStateHandle {
         Self { tx, counters }
     }
 
-    fn request(&self, message: StateRequest) {
+    pub(crate) fn request(&self, message: StateRequest) {
         self.counters.record_enqueue();
         self.tx.send(message).expect("dice runner died");
     }
@@ -135,7 +133,7 @@ impl CoreStateHandle {
         self.counters.approx_depth()
     }
 
-    fn call<T>(
+    pub(crate) fn call<T>(
         &self,
         message: StateRequest,
         recv: Receiver<T>,
@@ -291,31 +289,6 @@ impl CoreStateHandle {
         self.request(StateRequest::EvictKeys { keys })
     }
 
-    /// The active transactions' caches, cloned for off-thread scanning.
-    pub(crate) fn active_caches(&self) -> impl Future<Output = Vec<SharedCache>> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::ActiveCaches { resp }, recv)
-    }
-
-    /// Collect nodes eligible for pressure eviction (hydrated, unpinned, no
-    /// pending rdep task). `referenced`/`pending` are prebuilt off-thread from
-    /// [`active_caches`](Self::active_caches).
-    pub(crate) fn pressure_candidates(
-        &self,
-        referenced: crate::HashSet<DiceKey>,
-        pending: crate::HashSet<DiceKey>,
-    ) -> impl Future<Output = Vec<PressureCandidate>> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(
-            StateRequest::PressureCandidates {
-                referenced,
-                pending,
-                resp,
-            },
-            recv,
-        )
-    }
-
     /// Mark nodes that page-out could not serialize so they are not offered as
     /// candidates again. Fire-and-forget (FIFO, as with `evict_keys`).
     pub(crate) fn mark_non_pageable(&self, keys: Vec<DiceKey>) {
@@ -330,31 +303,6 @@ impl CoreStateHandle {
     }
 
     /// Collect metrics
-    /// Persist support: extract snapshot metadata for every node.
-    pub(crate) fn persist_extract(
-        &self,
-    ) -> impl Future<Output = (VersionNumber, Vec<PersistNodeExtract>)> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(StateRequest::PersistExtract { resp }, recv)
-    }
-
-    /// Persist support: install reconstructed nodes into the (empty) graph.
-    pub(crate) fn persist_install(
-        &self,
-        nodes: Vec<(DiceKey, VersionedGraphNode)>,
-        at_version: VersionNumber,
-    ) -> impl Future<Output = ()> + use<> {
-        let (resp, recv) = oneshot::channel();
-        self.call(
-            StateRequest::PersistInstall {
-                nodes,
-                at_version,
-                resp,
-            },
-            recv,
-        )
-    }
-
     pub(crate) fn metrics(&self) -> Metrics {
         let (resp, recv) = oneshot::channel();
         self.request(StateRequest::Metrics { resp });
@@ -402,7 +350,7 @@ pub(crate) fn init_state() -> CoreStateHandle {
 }
 
 /// Core state is accessed via message passing to a single threaded processor
-pub(super) enum StateRequest {
+pub(crate) enum StateRequest {
     /// Updates the core state with the given set of changes. The new VersionNumber that should be
     /// used is sent back via the channel provided
     UpdateState {
@@ -410,7 +358,9 @@ pub(super) enum StateRequest {
         resp: Sender<VersionNumber>,
     },
     /// Gets the current version number
-    CurrentVersion { resp: Sender<VersionNumber> },
+    CurrentVersion {
+        resp: Sender<VersionNumber>,
+    },
     /// Obtains the shared state ctx at the given version
     CtxAtVersion {
         version: VersionNumber,
@@ -418,7 +368,9 @@ pub(super) enum StateRequest {
         resp: Sender<(VersionEpochState, ActiveTransactionGuard)>,
     },
     /// Report that a computation context at a version has been dropped
-    DropCtxAtVersion { version: VersionNumber },
+    DropCtxAtVersion {
+        version: VersionNumber,
+    },
     /// Lookup the state of a key
     LookupKey {
         key: VersionedGraphKey,
@@ -453,7 +405,9 @@ pub(super) enum StateRequest {
         resp: Sender<TransactionResult<DiceComputedValue>>,
     },
     /// Get all the tasks pending cancellation
-    GetTasksPendingCancellation { resp: Sender<Vec<DiceTask>> },
+    GetTasksPendingCancellation {
+        resp: Sender<Vec<DiceTask>>,
+    },
     /// For unstable take
     UnstableDropEverything,
     /// Collect the keys of all paged-out graph nodes.
@@ -461,10 +415,14 @@ pub(super) enum StateRequest {
         resp: Sender<anyhow::Result<Vec<(DiceKey, DataKey)>>>,
     },
     /// Classify graph nodes as resident vs paged out.
-    PagableStatus { resp: Sender<PagableStatusRaw> },
+    PagableStatus {
+        resp: Sender<PagableStatusRaw>,
+    },
     /// Resident, paged-out, and candidate node counts, read O(1) from the core-state
     /// tallies.
-    PagableNodeCounts { resp: Sender<PagableNodeCounts> },
+    PagableNodeCounts {
+        resp: Sender<PagableNodeCounts>,
+    },
     /// Collect nodes that need serialization before they can be paged out.
     KeysToPageOut {
         resp: Sender<Vec<(DiceKey, DiceValidValue)>>,
@@ -475,31 +433,22 @@ pub(super) enum StateRequest {
         keys: Vec<(DiceKey, DataKey, DiceValidValue)>,
     },
     /// Mark nodes that page-out could not serialize.
-    MarkNonPageable { keys: Vec<DiceKey> },
-    /// The active transactions' caches, for off-thread scanning.
-    ActiveCaches { resp: Sender<Vec<SharedCache>> },
-    /// Collect nodes eligible for pressure eviction.
-    PressureCandidates {
-        referenced: crate::HashSet<DiceKey>,
-        pending: crate::HashSet<DiceKey>,
-        resp: Sender<Vec<PressureCandidate>>,
+    MarkNonPageable {
+        keys: Vec<DiceKey>,
     },
     /// Replace the paged-out value at `key` with its hydrated form.
-    Rehydrate { key: DiceKey, value: DiceValidValue },
-    /// Persist support: extract every node's metadata for a snapshot, plus
-    /// the version it was taken at.
-    PersistExtract {
-        resp: Sender<(VersionNumber, Vec<PersistNodeExtract>)>,
+    Rehydrate {
+        key: DiceKey,
+        value: DiceValidValue,
     },
-    /// Persist support: install reconstructed nodes into an empty graph and
-    /// fast-forward the version counter to the snapshot's version.
-    PersistInstall {
-        nodes: Vec<(DiceKey, VersionedGraphNode)>,
-        at_version: VersionNumber,
-        resp: Sender<()>,
-    },
+    /// Fork additions, one variant each so this enum and the processor's match
+    /// gain a single line per feature rather than one per request.
+    Pressure(PressureRequest),
+    Persist(PersistRequest),
     /// Collect metrics
-    Metrics { resp: Sender<Metrics> },
+    Metrics {
+        resp: Sender<Metrics>,
+    },
     /// Collects the introspectable dice state
     Introspection {
         resp: Sender<(VersionedGraphIntrospectable, VersionIntrospectable)>,

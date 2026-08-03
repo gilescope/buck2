@@ -143,38 +143,14 @@ impl StateProcessor {
             StateRequest::EvictKeys { keys } => {
                 self.state.evict_keys(keys);
             }
-            StateRequest::ActiveCaches { resp } => {
-                drop(resp.send(self.state.active_caches()));
-            }
-            StateRequest::PressureCandidates {
-                referenced,
-                pending,
-                resp,
-            } => {
-                drop(
-                    resp.send(
-                        self.state
-                            .pressure_eviction_candidates(&referenced, &pending),
-                    ),
-                );
-            }
             StateRequest::MarkNonPageable { keys } => {
                 self.state.mark_non_pageable(keys);
             }
             StateRequest::Rehydrate { key, value } => {
                 self.state.rehydrate(key, value);
             }
-            StateRequest::PersistExtract { resp } => {
-                let _ignored = resp.send(self.state.persist_extract());
-            }
-            StateRequest::PersistInstall {
-                nodes,
-                at_version,
-                resp,
-            } => {
-                self.state.persist_install(nodes, at_version);
-                let _ignored = resp.send(());
-            }
+            StateRequest::Pressure(req) => req.handle(&mut self.state),
+            StateRequest::Persist(req) => req.handle(&mut self.state),
             StateRequest::Metrics { resp } => {
                 let _ignored = resp.send(self.state.metrics());
             }

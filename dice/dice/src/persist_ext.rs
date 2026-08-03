@@ -16,11 +16,17 @@
 use std::sync::Arc as StdArc;
 
 use dupe::Dupe;
+use futures::Future;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::Sender;
 
 use crate::core::graph::nodes::VersionedGraphNode;
 use crate::core::internals::CoreState;
+use crate::core::state::CoreStateHandle;
+use crate::core::state::StateRequest;
 use crate::dice::Dice;
 use crate::key::DiceKey;
+use crate::persist::PersistNodeExtract;
 use crate::versions::VersionNumber;
 
 impl Dice {
@@ -125,5 +131,69 @@ impl CoreState {
     ) {
         self.graph.install_persisted_nodes(nodes, at_version);
         self.version_tracker.fast_forward_for_persist(at_version);
+    }
+}
+
+/// Snapshot save/load core-state requests, carried as one [`StateRequest`]
+/// variant. See [`crate::pressure::PressureRequest`] for the same shape.
+pub(crate) enum PersistRequest {
+    /// Extract every node's metadata for a snapshot, plus the version it was
+    /// taken at.
+    Extract {
+        resp: Sender<(VersionNumber, Vec<PersistNodeExtract>)>,
+    },
+    /// Install reconstructed nodes into an empty graph and fast-forward the
+    /// version counter to the snapshot's version.
+    Install {
+        nodes: Vec<(DiceKey, VersionedGraphNode)>,
+        at_version: VersionNumber,
+        resp: Sender<()>,
+    },
+}
+
+impl PersistRequest {
+    /// Run on the core-state thread. Dropped senders mean the caller went away.
+    pub(crate) fn handle(self, state: &mut CoreState) {
+        match self {
+            PersistRequest::Extract { resp } => drop(resp.send(state.persist_extract())),
+            PersistRequest::Install {
+                nodes,
+                at_version,
+                resp,
+            } => {
+                state.persist_install(nodes, at_version);
+                let _ignored = resp.send(());
+            }
+        }
+    }
+}
+
+impl CoreStateHandle {
+    /// Persist support: extract snapshot metadata for every node.
+    pub(crate) fn persist_extract(
+        &self,
+    ) -> impl Future<Output = (VersionNumber, Vec<PersistNodeExtract>)> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(
+            StateRequest::Persist(PersistRequest::Extract { resp }),
+            recv,
+        )
+    }
+
+    /// Persist support: install reconstructed nodes into the (empty) graph.
+    pub(crate) fn persist_install(
+        &self,
+        nodes: Vec<(DiceKey, VersionedGraphNode)>,
+        at_version: VersionNumber,
+    ) -> impl Future<Output = ()> + use<> {
+        let (resp, recv) = oneshot::channel();
+        self.call(
+            StateRequest::Persist(PersistRequest::Install {
+                nodes,
+                at_version,
+                resp,
+            }),
+            recv,
+        )
     }
 }

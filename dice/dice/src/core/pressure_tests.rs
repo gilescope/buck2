@@ -13,7 +13,6 @@
 //! Lives under `core` rather than beside the implementation so it can reach
 //! `CoreState`'s `pub(super)` methods without widening any of them.
 
-
 use allocative::Allocative;
 use async_trait::async_trait;
 use derive_more::Display;
