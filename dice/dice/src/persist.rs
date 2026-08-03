@@ -11,8 +11,7 @@
 //! DICE graph snapshot persistence.
 //!
 //! Design: `docs/dice-state-on-disk.md`. The versioned graph already
-//! implements partial invalidation in memory;
-//! persistence makes it durable. The division of labour with the existing
+//! implements partial invalidation in memory; persistence makes it durable. The division of labour with the existing
 //! page-out machinery (`DiceStorage`):
 //!
 //! - Values ride the page-out path unchanged: content-addressed blobs in the
@@ -638,18 +637,13 @@ pub(crate) async fn load_snapshot(
     let mut erased_keys: Vec<Option<DiceKeyErased>> = Vec::with_capacity(meta.records.len());
     for record in &meta.records {
         let loaded = match record.key() {
-            PersistedKey::Plain { blob } => {
-                match fetch_and_deserialize::<dyn crate::key::DiceKeyDyn>(
-                    storage,
-                    &handle,
-                    pagable::DataKey::from_key_value(*blob)?,
-                )
-                .await
-                {
-                    Some(boxed) => Some(DiceKeyErased::Key(Arc::from(boxed))),
-                    None => None,
-                }
-            }
+            PersistedKey::Plain { blob } => fetch_and_deserialize::<dyn crate::key::DiceKeyDyn>(
+                storage,
+                &handle,
+                pagable::DataKey::from_key_value(*blob)?,
+            )
+            .await
+            .map(|boxed| DiceKeyErased::Key(Arc::from(boxed))),
             PersistedKey::Projection { proj_blob, base } => {
                 let base_key = usize::try_from(*base)
                     .ok()
