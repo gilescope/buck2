@@ -74,7 +74,7 @@ impl AnalysisResult {
     }
 
     /// Persist support: the action graph without the provider heap (the S3
-    /// "analysis dodge" - see dice/dice/docs/persistence_plan.md). Validations
+    /// "analysis dodge" - see dice/dice/docs/dice-state-on-disk.md). Validations
     /// and profile data ride the heap's fate.
     pub fn actions_only_for_persist(&self) -> Self {
         Self {

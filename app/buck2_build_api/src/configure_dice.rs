@@ -205,7 +205,7 @@ fn spawn_pressure_evictor(dice: std::sync::Weak<Dice>, high: u64, low: u64) {
     let poll = std::time::Duration::from_secs(env_u64("BUCK2_DICE_EVICT_POLL_SECS", 10));
     let chunk = usize::try_from(env_u64("BUCK2_DICE_EVICT_CHUNK", 4096)).unwrap_or(4096);
     // AnalysisKey values dominate the build-tail heap (see
-    // dice/docs/tail_memory_plan.md); other key types opt in via env.
+    // dice/dice/docs/dice-state-on-disk.md); other key types opt in via env.
     let allowed: std::collections::HashSet<String> = std::env::var("BUCK2_DICE_EVICT_ALLOW")
         .unwrap_or_else(|_| "AnalysisKey".to_owned())
         .split(',')

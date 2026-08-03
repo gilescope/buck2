@@ -10,8 +10,8 @@
 
 //! DICE graph snapshot persistence.
 //!
-//! Design: `docs/persistence_plan.md` + `docs/persistence_impl.md`. The
-//! versioned graph already implements partial invalidation in memory;
+//! Design: `docs/dice-state-on-disk.md`. The versioned graph already
+//! implements partial invalidation in memory;
 //! persistence makes it durable. The division of labour with the existing
 //! page-out machinery (`DiceStorage`):
 //!
