@@ -39,9 +39,9 @@ use crate::versions::VersionNumber;
 
 /// Core state of DICE, holding the actual graph and version information
 #[derive(allocative::Allocative)]
-pub(super) struct CoreState {
-    version_tracker: VersionTracker,
-    graph: VersionedGraph,
+pub(crate) struct CoreState {
+    pub(crate) version_tracker: VersionTracker,
+    pub(crate) graph: VersionedGraph,
     pending_termination_tasks: Vec<DiceTask>,
 }
 
@@ -55,16 +55,6 @@ pub(crate) struct PagableStatusRaw {
     /// Per-key-type breakdown source; lengths equal `counts.resident` / `counts.paged_out`.
     pub(crate) resident: Vec<DiceKey>,
     pub(crate) paged_out: Vec<DiceKey>,
-}
-
-/// One node eligible for pressure eviction, from
-/// `CoreState::pressure_eviction_candidates`. The value is an `Arc` dupe; the
-/// caller sizes/serializes it off the state thread.
-pub(crate) struct PressureCandidate {
-    pub(crate) key: DiceKey,
-    pub(crate) value: DiceValidValue,
-    /// Coldness rank (older = colder); see `OccupiedGraphNode::last_verified_begin`.
-    pub(crate) last_verified_begin: VersionNumber,
 }
 
 impl CoreState {
@@ -174,109 +164,6 @@ impl CoreState {
                 }
             }
         }
-    }
-
-    /// The active transactions' caches, for off-state-thread inspection (the
-    /// cache structures are concurrent). Cheap: clones of `Arc`d handles.
-    pub(super) fn active_caches(&self) -> Vec<SharedCache> {
-        self.version_tracker
-            .currently_active()
-            .map(|(_refcount, cache)| cache.dupe())
-            .collect()
-    }
-
-    /// Nodes eligible for pressure eviction: occupied, hydrated, not in
-    /// `referenced` (keys referenced by an active transaction's cache - the
-    /// cache pins the value's `Arc`, so evicting those frees nothing), and
-    /// with no rdep in `pending` (an in-flight parent may read the value
-    /// straight back - thrash). The caller builds both sets off this thread
-    /// from `active_caches()` - scanning the caches here would stall the
-    /// core-state thread, which is the build's bottleneck (measured: +75%
-    /// wall on an analysis-heavy leg at a 5s poll). The sets may be slightly
-    /// stale; evicting a just-completed value is harmless (it stays pinned by
-    /// its cache until the transaction drops, then hydrates on demand).
-    pub(super) fn pressure_eviction_candidates(
-        &self,
-        referenced: &crate::HashSet<DiceKey>,
-        pending: &crate::HashSet<DiceKey>,
-    ) -> Vec<PressureCandidate> {
-        // Enumerated from the graph's page-out candidate set (resident and never
-        // paged out), same source as `keys_to_page_out`, rather than scanning
-        // every node.
-        self.graph
-            .page_out_candidates()
-            .iter()
-            .filter_map(|index| {
-                let key = DiceKey {
-                    index: index as u32,
-                };
-                let VersionedGraphNode::Occupied(occ) = self.graph.nodes().get(&key)? else {
-                    return None;
-                };
-                let value = occ.val().as_hydrated()?;
-                if referenced.contains(&key) {
-                    return None;
-                }
-                if occ.rdeps().any(|r| pending.contains(&r)) {
-                    return None;
-                }
-                Some(PressureCandidate {
-                    key,
-                    value: value.dupe(),
-                    last_verified_begin: occ.last_verified_begin(),
-                })
-            })
-            .collect()
-    }
-
-    /// Persist support: extract every node's snapshot metadata. Runs on the
-    /// state thread; everything returned is plain data + Arc clones.
-    pub(super) fn persist_extract(
-        &self,
-    ) -> (VersionNumber, Vec<crate::persist::PersistNodeExtract>) {
-        use crate::persist::PersistNodeExtract;
-        use crate::persist::PersistValueExtract;
-        let mut out = Vec::with_capacity(self.graph.nodes().len());
-        for (key, node) in self.graph.nodes() {
-            match node {
-                VersionedGraphNode::Occupied(occ) => {
-                    let (deps, ranges, dirtied) = occ.parts_for_persist();
-                    let value = match (occ.val().data_key(), occ.val().as_hydrated()) {
-                        (Some(dk), _) => PersistValueExtract::Paged(dk),
-                        (None, Some(v)) => PersistValueExtract::Hydrated(v.dupe()),
-                        (None, None) => continue, // unreachable by PagableNodeValue invariant
-                    };
-                    out.push(PersistNodeExtract::Occupied {
-                        key: *key,
-                        deps: deps.iter_keys().collect(),
-                        verified_ranges: ranges.clone(),
-                        dirtied_history: dirtied.clone(),
-                        value,
-                    });
-                }
-                VersionedGraphNode::Injected(inj) => {
-                    let (first_valid, value) = inj.latest_for_persist();
-                    out.push(PersistNodeExtract::Injected {
-                        key: *key,
-                        first_valid_version: first_valid,
-                        value: value.dupe(),
-                    });
-                }
-                VersionedGraphNode::Vacant(_) => {}
-            }
-        }
-        (self.version_tracker.current(), out)
-    }
-
-    /// Persist support: install reconstructed nodes and resume version
-    /// numbering at the snapshot's version.
-    pub(super) fn persist_install(
-        &mut self,
-        nodes: Vec<(DiceKey, VersionedGraphNode)>,
-        at_version: VersionNumber,
-    ) {
-        self.graph.install_persisted_nodes(nodes, at_version);
-        self.version_tracker.fast_forward_for_persist(at_version);
     }
 
     /// Mark nodes that page-out considered but could not serialize, so they are
@@ -437,120 +324,6 @@ mod tests {
     use crate::value::DiceValidValue;
     use crate::value::TrackedInvalidationPaths;
     use crate::versions::VersionNumber;
-
-    /// Checked eviction: a node holding a different value (recomputed since
-    /// serialization) must not be paged out against the stale bytes.
-    #[test]
-    fn evict_keys_skips_nodes_holding_a_different_value() {
-        let mut core = CoreState::new();
-        let v = VersionNumber::FIRST;
-        let (epoch, _ctx) = core.ctx_at_version(v);
-        let key = DiceKey { index: 0 };
-        let value = DiceValidValue::testing_new(DiceKeyValue::<K>::new(1));
-        core.update_computed(
-            VersionedGraphKey::new(v, key),
-            epoch,
-            StorageType::Normal,
-            value.dupe(),
-            ValueReusable::EqualityBased,
-            Arc::new(SeriesParallelDeps::None),
-            TrackedInvalidationPaths::clean(),
-        )
-        .unpack()
-        .unwrap();
-
-        // Same contents, different allocation - models a recompute that landed
-        // between serialization and the evict message.
-        let stale = DiceValidValue::testing_new(DiceKeyValue::<K>::new(1));
-        core.evict_keys(vec![(key, pagable::DataKey::testing_new(1), stale)]);
-        let status = core.pagable_status();
-        assert_eq!(
-            (status.resident.len(), status.paged_out.len()),
-            (1, 0),
-            "stale-value eviction must be skipped"
-        );
-
-        core.evict_keys(vec![(key, pagable::DataKey::testing_new(1), value)]);
-        let status = core.pagable_status();
-        assert_eq!(
-            (status.resident.len(), status.paged_out.len()),
-            (0, 1),
-            "matching-value eviction pages out"
-        );
-    }
-
-    /// Pressure candidates exclude values referenced by an active
-    /// transaction's cache and values whose rdep has a pending task.
-    #[tokio::test]
-    async fn pressure_candidates_exclude_pinned_and_pending_rdeps() {
-        let mut core = CoreState::new();
-        let v = VersionNumber::FIRST;
-        let (epoch, cache) = core.ctx_at_version(v);
-        let dep = DiceKey { index: 1 };
-        let parent = DiceKey { index: 2 };
-        core.update_computed(
-            VersionedGraphKey::new(v, dep),
-            epoch,
-            StorageType::Normal,
-            DiceValidValue::testing_new(DiceKeyValue::<K>::new(1)),
-            ValueReusable::EqualityBased,
-            Arc::new(SeriesParallelDeps::None),
-            TrackedInvalidationPaths::clean(),
-        )
-        .unpack()
-        .unwrap();
-        // Records the rdep edge dep -> parent.
-        core.update_computed(
-            VersionedGraphKey::new(v, parent),
-            epoch,
-            StorageType::Normal,
-            DiceValidValue::testing_new(DiceKeyValue::<K>::new(2)),
-            ValueReusable::EqualityBased,
-            Arc::new(SeriesParallelDeps::serial_from_vec(vec![dep])),
-            TrackedInvalidationPaths::clean(),
-        )
-        .unpack()
-        .unwrap();
-
-        // A pending task for `parent` in the active cache: `parent` is
-        // referenced, and `dep` has a pending rdep - both must be excluded.
-        let pending_task = spawn_dice_task(parent, &TokioSpawner, &(), |handle| {
-            async move {
-                let _handle = handle;
-                futures::future::pending().await
-            }
-            .boxed()
-        });
-        cache.testing_insert_task(parent, pending_task);
-
-        // Mirror production: sets built off-thread from the active caches.
-        let collect = |core: &CoreState| {
-            let mut referenced = crate::HashSet::default();
-            let mut pending = crate::HashSet::default();
-            for c in core.active_caches() {
-                c.collect_referenced_keys(&mut referenced, &mut pending);
-            }
-            (referenced, pending)
-        };
-
-        let (referenced, pending) = collect(&core);
-        assert!(
-            core.pressure_eviction_candidates(&referenced, &pending)
-                .is_empty(),
-            "pinned value and pending-rdep dep must both be excluded"
-        );
-
-        // Transaction gone: both become candidates.
-        core.drop_ctx_at_version(v);
-        let (referenced, pending) = collect(&core);
-        let mut keys: Vec<_> = core
-            .pressure_eviction_candidates(&referenced, &pending)
-            .iter()
-            .map(|c| c.key.index)
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(keys, vec![1, 2]);
-    }
 
     #[test]
     fn update_state_gets_next_version() {

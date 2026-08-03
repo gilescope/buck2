@@ -9,7 +9,9 @@
  */
 
 pub(crate) mod graph;
-mod internals;
+pub(crate) mod internals;
+#[cfg(test)]
+mod pressure_tests;
 mod processor;
 pub(crate) mod state;
 pub(crate) mod versions;

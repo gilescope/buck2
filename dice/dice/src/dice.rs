@@ -175,57 +175,6 @@ impl Dice {
         tasks.iter().all(|task| !task.is_pending())
     }
 
-    /// Persist the whole graph as a snapshot: values into the configured
-    /// `DiceStorage`, skeleton into `meta_path`. `inputs_digest` should hash
-    /// everything identity-defining (binary, configs) - load validates it.
-    ///
-    /// Caller must ensure DICE is idle (`wait_for_idle().await`).
-    pub async fn save_persisted_snapshot(
-        self: &StdArc<Self>,
-        meta_path: &std::path::Path,
-        inputs_digest: [u8; 32],
-        deny_key_types: &std::collections::HashSet<String>,
-    ) -> anyhow::Result<crate::persist::PersistStats> {
-        self.page_out().await?;
-        let Some(storage) = self.pagable_storage.as_ref() else {
-            return Err(anyhow::anyhow!(
-                "save_persisted_snapshot requires pagable storage (set_pagable_storage)"
-            ));
-        };
-        crate::persist::save_snapshot(
-            &self.state_handle,
-            &self.key_index,
-            storage,
-            meta_path,
-            inputs_digest,
-            deny_key_types,
-        )
-        .await
-    }
-
-    /// Load a snapshot saved by `save_persisted_snapshot` into this
-    /// freshly-built DICE. Returns `Ok(None)` = cold start (missing file or
-    /// header mismatch). Must be called before any computation runs.
-    pub async fn load_persisted_snapshot(
-        self: &StdArc<Self>,
-        meta_path: &std::path::Path,
-        inputs_digest: [u8; 32],
-    ) -> anyhow::Result<Option<crate::persist::PersistStats>> {
-        let Some(storage) = self.pagable_storage.as_ref() else {
-            return Err(anyhow::anyhow!(
-                "load_persisted_snapshot requires pagable storage (set_pagable_storage)"
-            ));
-        };
-        crate::persist::load_snapshot(
-            &self.state_handle,
-            &self.key_index,
-            storage,
-            meta_path,
-            inputs_digest,
-        )
-        .await
-    }
-
     /// Page out every paged-in `OccupiedGraphNode` value to the configured `DiceStorage`.
     ///
     /// **Caller must ensure DICE is idle** before calling this — typically by awaiting
@@ -268,92 +217,6 @@ impl Dice {
         storage
             .page_out(keys, &self.key_index, &self.state_handle, cancelled)
             .await
-    }
-
-    /// Targeted eviction for memory pressure: page out cold values while
-    /// builds may still be running - unlike [`Dice::page_out`], no idle
-    /// requirement. Later lookups of an evicted key hydrate on demand.
-    ///
-    /// Candidates exclude values referenced by any active transaction's cache
-    /// (the cache pins the `Arc`, so evicting those frees nothing) and values
-    /// with an rdep task still pending (likely read straight back - thrash).
-    /// Coldest first, ranked by last-verified version. Only key types named in
-    /// `allowed_key_types` (matched against `Key::key_type_name`, e.g.
-    /// `"AnalysisKey"`) are eligible.
-    ///
-    /// `max_values` bounds how many values this call evicts. It is a count,
-    /// not bytes, deliberately: per-value resident size is not reliably
-    /// measurable before L2 (values share arenas behind `Arc`s, so both
-    /// unique-ownership walks and serialized size mis-state what an eviction
-    /// frees). The caller's watermark loop is the controller - evict a chunk,
-    /// purge the allocator, re-measure RSS, repeat until under the low
-    /// watermark. Values already serialized by an earlier page-out are
-    /// evicted without re-serialization.
-    ///
-    /// All evictions have been applied on the core-state thread by the time
-    /// this returns. No-op without pagable storage.
-    pub async fn evict_under_pressure(
-        self: &StdArc<Self>,
-        max_values: usize,
-        allowed_key_types: &std::collections::HashSet<String>,
-    ) -> anyhow::Result<PressureEvictStats> {
-        let Some(storage) = self.pagable_storage.as_ref() else {
-            return Ok(PressureEvictStats::default());
-        };
-
-        // Scan the active transactions' caches off the core-state thread -
-        // they're concurrent structures, and the state thread is the build's
-        // bottleneck. Slight staleness is fine (see
-        // `CoreState::pressure_eviction_candidates`).
-        let caches = self.state_handle.active_caches().await;
-        let (referenced, pending) = tokio::task::spawn_blocking(move || {
-            let mut referenced = crate::HashSet::default();
-            let mut pending = crate::HashSet::default();
-            for cache in &caches {
-                cache.collect_referenced_keys(&mut referenced, &mut pending);
-            }
-            (referenced, pending)
-        })
-        .await?;
-        let mut candidates = self
-            .state_handle
-            .pressure_candidates(referenced, pending)
-            .await;
-        candidates
-            .retain(|c| allowed_key_types.contains(self.key_index.get(c.key).key_type_name()));
-        let candidate_count = candidates.len();
-        candidates.sort_by_key(|c| c.last_verified_begin);
-        candidates.truncate(max_values);
-
-        // Every candidate needs serializing: a candidate is a value that has
-        // never been paged out, so none of them have bytes on disk already.
-        let mut to_serialize: Vec<_> = candidates.into_iter().map(|c| (c.key, c.value)).collect();
-
-        let stats = PressureEvictStats {
-            candidates: candidate_count,
-            selected: to_serialize.len(),
-        };
-        // Serialize in small sub-batches: page-out transiently buffers each
-        // value's serialized bytes (blob slots + backend WAL), and under
-        // pressure that transient must stay bounded - a single sweep paging
-        // out 2.5GB of values spiked RSS 3.3GB ABOVE the no-eviction
-        // baseline. Each page_out call flushes and releases its buffers, so
-        // the graph frees progressively as batches complete. Cost: shared
-        // subtrees re-serialize across batches (the store dedups them at
-        // rest) - CPU spent to keep the memory envelope flat.
-        const SERIALIZE_BATCH: usize = 256;
-        while !to_serialize.is_empty() {
-            let split = to_serialize.len().min(SERIALIZE_BATCH);
-            let batch: Vec<_> = to_serialize.drain(..split).collect();
-            storage
-                .page_out(batch, &self.key_index, &self.state_handle, || false)
-                .await?;
-        }
-        // Drain the core-state FIFO so every eviction message has been
-        // processed before we report back (callers purge the allocator next).
-        // Any async round-trip works as the barrier; this is the cheapest.
-        let _ = self.state_handle.current_version().await;
-        Ok(stats)
     }
 
     /// Page in (rehydrate) all paged-out `OccupiedGraphNode` values from the
@@ -440,18 +303,6 @@ pub struct PagableNodeCounts {
     pub resident: usize,
     pub paged_out: usize,
     pub candidates: usize,
-}
-
-/// Result summary of [`Dice::evict_under_pressure`]. Counts are of *attempted*
-/// evictions - a value recomputed mid-flight is skipped by the checked
-/// eviction on the state thread and stays resident. RSS is the ground truth;
-/// these numbers only steer the caller's hysteresis loop.
-#[derive(Debug, Default)]
-pub struct PressureEvictStats {
-    /// Eligible cold values before the byte target cut selection off.
-    pub candidates: usize,
-    /// Values selected for eviction this call.
-    pub selected: usize,
 }
 
 /// Summary of how many DICE node values are resident in memory vs paged out to
