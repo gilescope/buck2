@@ -25,6 +25,23 @@ Policy: nothing here goes upstream without an explicit per-PR decision
   a workspace dep. Small, generally useful (snapshots report live RSS
   on mac).
 
+- **http_archive unpack dedupe** (`33d7b36ab`). An archive's output is a
+  pure function of its download attributes, but every target platform
+  re-downloads and re-unpacks it under its own configuration hash. A
+  transition collapses them to one canonical unpack configuration;
+  policy is a buckconfig key (`buck2.archive_unpack_constraints`), unset
+  = no-op, same pattern as `constraint_overrides.bzl`. Field evidence:
+  2,185 crates x 3 platforms of duplicated download+unpack per lap.
+  Soak: it has run in buck2-fixups as a re-applied patch since
+  2026-07-17 - now in the fork's own prelude, so the mileage from here
+  is honest rather than "usually applied".
+- **buildscript exec-bit heal + OSError forensics** (`be8664998`).
+  REAPI carries no file modes, so a cargo buildscript can arrive
+  non-executable and die with a bare OSError. chmod at the point of use
+  (exec only, never +w - it may be a hardlinked CAS inode), and print
+  mode/size on failure. Rode in on the unpack-dedupe patch despite being
+  unrelated; separated so each can be offered on its own merits.
+
 ## Longer soak / needs carving out of the persistence stack
 
 - **Checked eviction** (`ebdba955a`, part of): `CoreState::evict_keys`
