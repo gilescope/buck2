@@ -249,10 +249,9 @@ fn spawn_pressure_evictor(dice: std::sync::Weak<Dice>, high: u64, low: u64) {
                     .rss_bytes
                     .unwrap_or(rss);
                 tracing::info!(
-                    "dice pressure: evicted {} of {} candidates ({} pre-serialized); rss {rss}B -> {new_rss}B",
+                    "dice pressure: evicted {} of {} candidates; rss {rss}B -> {new_rss}B",
                     stats.selected,
                     stats.candidates,
-                    stats.already_serialized,
                 );
                 // Stop on target reached, candidates exhausted, or no forward
                 // progress (evictions pinned elsewhere / allocator holding).

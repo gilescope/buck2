@@ -63,8 +63,6 @@ pub(crate) struct PagableStatusRaw {
 pub(crate) struct PressureCandidate {
     pub(crate) key: DiceKey,
     pub(crate) value: DiceValidValue,
-    /// `Some` = bytes already on disk; eviction needs no re-serialization.
-    pub(crate) data_key: Option<DataKey>,
     /// Coldness rank (older = colder); see `OccupiedGraphNode::last_verified_begin`.
     pub(crate) last_verified_begin: VersionNumber,
 }
@@ -225,7 +223,6 @@ impl CoreState {
                 Some(PressureCandidate {
                     key,
                     value: value.dupe(),
-                    data_key: occ.val().data_key(),
                     last_verified_begin: occ.last_verified_begin(),
                 })
             })

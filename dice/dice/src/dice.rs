@@ -325,23 +325,14 @@ impl Dice {
         candidates.sort_by_key(|c| c.last_verified_begin);
         candidates.truncate(max_values);
 
-        let mut free_evictions = Vec::new();
-        let mut to_serialize = Vec::new();
-        for c in candidates {
-            match c.data_key {
-                Some(data_key) => free_evictions.push((c.key, data_key, c.value)),
-                None => to_serialize.push((c.key, c.value)),
-            }
-        }
+        // Every candidate needs serializing: a candidate is a value that has
+        // never been paged out, so none of them have bytes on disk already.
+        let mut to_serialize: Vec<_> = candidates.into_iter().map(|c| (c.key, c.value)).collect();
 
         let stats = PressureEvictStats {
             candidates: candidate_count,
-            selected: free_evictions.len() + to_serialize.len(),
-            already_serialized: free_evictions.len(),
+            selected: to_serialize.len(),
         };
-        if !free_evictions.is_empty() {
-            self.state_handle.evict_keys(free_evictions);
-        }
         // Serialize in small sub-batches: page-out transiently buffers each
         // value's serialized bytes (blob slots + backend WAL), and under
         // pressure that transient must stay bounded - a single sweep paging
@@ -461,9 +452,6 @@ pub struct PressureEvictStats {
     pub candidates: usize,
     /// Values selected for eviction this call.
     pub selected: usize,
-    /// Of `selected`, how many already had bytes on disk and were evicted
-    /// without re-serialization.
-    pub already_serialized: usize,
 }
 
 /// Summary of how many DICE node values are resident in memory vs paged out to
