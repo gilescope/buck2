@@ -70,6 +70,7 @@ use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::MaterializationError;
+use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute_local::CommandResult;
 use buck2_execute_local::DefaultKillProcess;
@@ -100,7 +101,6 @@ use futures::future;
 use futures::future::Either;
 use futures::future::FutureExt;
 use futures::future::Shared;
-use futures::future::join_all;
 use futures::stream::StreamExt;
 use gazebo::prelude::*;
 use host_sharing::HostSharingBroker;
@@ -1028,7 +1028,10 @@ impl LocalExecutor {
         .await?;
 
         self.materializer
-            .ensure_materialized(configuration_paths)
+            .ensure_materialized(
+                configuration_paths,
+                MaterializationPurpose::IntermediateOnly,
+            )
             .await?;
 
         Ok((
@@ -1221,7 +1224,7 @@ impl LocalExecutor {
 
             // The materialization we do for incremental action outputs is best-effort. The copy
             // will fail if the materialization failed, and that's okay.
-            join_all(copy_futs).await;
+            buck2_util::future::join_all(copy_futs).await;
         }
 
         Ok(())
@@ -1562,7 +1565,9 @@ async fn materialize_build_outputs(
         }
     }
 
-    materializer.ensure_materialized(paths.clone()).await?;
+    materializer
+        .ensure_materialized(paths.clone(), MaterializationPurpose::IntermediateOnly)
+        .await?;
 
     Ok(paths)
 }
@@ -1783,11 +1788,11 @@ mod tests {
     use buck2_core::fs::project::ProjectRoot;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_execute::execute::blocking::testing::DummyBlockingExecutor;
-    use buck2_execute::materialize::nodisk::NoDiskMaterializer;
     use buck2_hash::StdBuckHashMap;
     use host_sharing::HostSharingStrategy;
 
     use super::*;
+    use crate::materializers::deferred::NoDiskDeferredMaterializer;
 
     fn artifact_fs(project_fs: ProjectRoot) -> ArtifactFs {
         ArtifactFs::new(
@@ -1807,7 +1812,9 @@ mod tests {
 
         let executor = LocalExecutor::new(
             artifact_fs,
-            Arc::new(NoDiskMaterializer),
+            Arc::new(NoDiskDeferredMaterializer::testing_new_no_disk(
+                project_fs.dupe(),
+            )?),
             Arc::new(IncrementalDbState::db_disabled()),
             Arc::new(DummyBlockingExecutor {
                 fs: project_fs.dupe(),

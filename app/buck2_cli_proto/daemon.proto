@@ -329,6 +329,9 @@ message UqueryRequest {
   repeated string output_attributes = 3;
   // The literals for a repeated query (one containing `%s`).
   repeated string query_args = 4;
+  // Skip nodes/edges that fail to load and return a best-effort partial
+  // result.
+  bool allow_partial_graph = 7;
 
   // These should possibly be deleted and never become real options. Let's not
   // pollute the low ids (and then forever need a comment about them).
@@ -820,6 +823,9 @@ message UnstableAllocatorStatsRequest {
   // Options to pass to the allocator stats backend (JEMalloc's
   // malloc_stats_print, see <https://linux.die.net/man/3/jemalloc>).
   string options = 1;
+  // If jemalloc is in use, force it to return dirty and muzzy pages to the OS
+  // before reading stats. Nop otherwise.
+  bool purge = 2;
 }
 
 message UnstableAllocatorStatsResponse {
@@ -971,6 +977,8 @@ enum HydrationSubcommand {
 message HydrationRequest {
   ClientContext context = 1;
   HydrationSubcommand subcommand = 2;
+  // `status --wait`: block until any in-progress idle page-out finishes.
+  bool wait = 3;
 }
 
 message HydrationResponse {

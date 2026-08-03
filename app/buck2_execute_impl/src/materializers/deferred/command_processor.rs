@@ -31,6 +31,7 @@ use buck2_execute::directory::ActionSharedDirectory;
 use buck2_execute::materialize::materializer::ArtifactNotMaterializedReason;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::MaterializationError;
+use buck2_execute::materialize::materializer::MaterializationPurpose;
 use buck2_execute::materialize::utils::dynamic_priority_handle::DynamicPriorityHandle;
 use buck2_execute::materialize::utils::priority_semaphore::Priority;
 use buck2_fs::fs_util::disk_space_stats;
@@ -72,6 +73,7 @@ use crate::materializers::deferred::MaterializerSender;
 use crate::materializers::deferred::SharedMaterializingError;
 use crate::materializers::deferred::TtlRefreshConfiguration;
 use crate::materializers::deferred::TtlRefreshHistoryEntry;
+use crate::materializers::deferred::artifact_tree::ArtifactClassification;
 use crate::materializers::deferred::artifact_tree::ArtifactMaterializationData;
 use crate::materializers::deferred::artifact_tree::ArtifactMaterializationMethod;
 use crate::materializers::deferred::artifact_tree::ArtifactMaterializationStage;
@@ -83,6 +85,7 @@ use crate::materializers::deferred::artifact_tree::Processing;
 use crate::materializers::deferred::artifact_tree::ProcessingFuture;
 use crate::materializers::deferred::artifact_tree::Version;
 use crate::materializers::deferred::artifact_tree::artifact_metadata_matches_entry;
+use crate::materializers::deferred::artifact_tree::artifact_metadata_size;
 use crate::materializers::deferred::clean_stale::AdaptiveLowDiskParams;
 use crate::materializers::deferred::clean_stale::CleanResult;
 use crate::materializers::deferred::clean_stale::CleanStaleArtifactsCommand;
@@ -121,7 +124,7 @@ pub(super) struct DeferredMaterializerCommandProcessor<T: 'static> {
     /// The current ttl_refresh instance, if any exists.
     ttl_refresh_instance: Option<oneshot::Receiver<(DateTime<Utc>, buck2_error::Result<()>)>>,
     pub(super) cancellations: &'static CancellationContext,
-    stats: Arc<DeferredMaterializerStats>,
+    pub(super) stats: Arc<DeferredMaterializerStats>,
     access_times_buffer: Option<StdBuckHashSet<ProjectRelativePathBuf>>,
     verbose_materializer_log: bool,
     daemon_dispatcher: EventDispatcher,
@@ -178,6 +181,7 @@ pub(super) enum MaterializerCommand<T: 'static> {
     /// concludes (whether successfully or not).
     Ensure(
         Vec<ProjectRelativePathBuf>,
+        MaterializationPurpose,
         EventDispatcher,
         Option<SpanId>,
         oneshot::Sender<BoxStream<'static, Result<(), MaterializationError>>>,
@@ -249,7 +253,9 @@ impl<T> std::fmt::Debug for MaterializerCommand<T> {
             MaterializerCommand::InvalidateFilePaths(paths, ..) => {
                 write!(f, "InvalidateFilePaths({paths:?})")
             }
-            MaterializerCommand::Ensure(paths, _, _, _) => write!(f, "Ensure({paths:?}, _)",),
+            MaterializerCommand::Ensure(paths, purpose, _, _, _) => {
+                write!(f, "Ensure({paths:?}, {purpose:?}, _)",)
+            }
             MaterializerCommand::Subscription(op) => write!(f, "Subscription({op:?})",),
             MaterializerCommand::Extension(ext) => write!(f, "Extension({ext:?})"),
             MaterializerCommand::Abort => write!(f, "Abort"),
@@ -800,9 +806,11 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                         )
                     });
 
-                    let existing_futs = self
-                        .tree
-                        .invalidate_paths_and_collect_futures(paths, self.sqlite_db.as_mut());
+                    let existing_futs = self.tree.invalidate_paths_and_collect_futures(
+                        paths,
+                        self.sqlite_db.as_mut(),
+                        &self.stats,
+                    );
 
                     // TODO: This probably shouldn't return a CleanFuture
                     sender
@@ -815,21 +823,29 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                 })
             }
             // Entry point for `ensure_materialized` calls
-            MaterializerCommand::Ensure(paths, event_dispatcher, parent_id, fut_sender) => {
-                maybe_proxy_current_span(parent_id, || {
-                    self.maybe_log_command(&event_dispatcher, || {
-                        buck2_data::materializer_command::Data::Ensure(
-                            buck2_data::materializer_command::Ensure {
-                                paths: paths.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
-                            },
-                        )
-                    });
+            MaterializerCommand::Ensure(
+                paths,
+                purpose,
+                event_dispatcher,
+                parent_id,
+                fut_sender,
+            ) => maybe_proxy_current_span(parent_id, || {
+                self.maybe_log_command(&event_dispatcher, || {
+                    buck2_data::materializer_command::Data::Ensure(
+                        buck2_data::materializer_command::Ensure {
+                            paths: paths.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                        },
+                    )
+                });
 
-                    fut_sender
-                        .send(self.materialize_many_artifacts(paths, event_dispatcher))
-                        .ok();
-                })
-            }
+                if purpose == MaterializationPurpose::FinalOutput {
+                    self.promote_final_output_closure(&paths);
+                }
+
+                fut_sender
+                    .send(self.materialize_many_artifacts(paths, event_dispatcher))
+                    .ok();
+            }),
             MaterializerCommand::Subscription(sub) => sub.execute(self),
             MaterializerCommand::Extension(ext) => ext.execute(self),
             MaterializerCommand::Abort => unreachable!(),
@@ -976,14 +992,98 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
         tasks.collect::<FuturesOrdered<_>>().boxed()
     }
 
+    fn promote_final_output_closure(&mut self, paths: &[ProjectRelativePathBuf]) {
+        let mut pending = paths.to_vec();
+        let mut visited: StdBuckHashSet<ProjectRelativePathBuf> = StdBuckHashSet::default();
+        let mut materialized_roots = Vec::new();
+
+        // Traverse all artifacts and deps transitively
+        while let Some(path) = pending.pop() {
+            let Some((root, data)) = Self::find_artifact_containing_path(&mut self.tree, &path)
+            else {
+                continue;
+            };
+            let root = root.to_owned();
+            if !visited.insert(root.clone()) {
+                continue;
+            }
+
+            let deps = data.deps.dupe();
+            let promotion = if data.classification == ArtifactClassification::FinalOutput {
+                None
+            } else {
+                data.classification = ArtifactClassification::FinalOutput;
+                Some((
+                    matches!(
+                        data.stage,
+                        ArtifactMaterializationStage::Materialized { .. }
+                    ),
+                    data.logical_size_bytes,
+                ))
+            };
+
+            if let Some(deps) = deps.as_ref() {
+                pending.extend(self.tree.find_artifacts(deps));
+            }
+
+            if let Some((true, logical_size_bytes)) = promotion {
+                self.stats.promote_materialized(logical_size_bytes);
+                materialized_roots.push(root);
+            }
+        }
+
+        if let Some(sqlite_db) = self.sqlite_db.as_mut()
+            && let Err(error) = sqlite_db
+                .materializer_state_table()
+                .update_classifications(&materialized_roots, ArtifactClassification::FinalOutput)
+        {
+            let _unused = soft_error!(
+                "materializer_update_classification_error",
+                error,
+                quiet: true
+            );
+        }
+    }
+
     fn declare_existing(&mut self, path: &ProjectRelativePath, value: ArtifactValue) {
         let metadata = value.entry().dupe();
+        let logical_size_bytes = artifact_metadata_size(&metadata);
+        let classification = {
+            let mut path_iter = path.iter();
+            match self.tree.prefix_get(&mut path_iter) {
+                Some(data)
+                    if path_iter.next().is_none()
+                        && matches!(
+                            &data.stage,
+                            ArtifactMaterializationStage::Materialized {
+                                metadata: previous_metadata,
+                                ..
+                            } if artifact_metadata_matches_entry(previous_metadata, &metadata)
+                        ) =>
+                {
+                    data.classification
+                }
+                _ => ArtifactClassification::IntermediateOnly,
+            }
+        };
+        if let Err(error) = self.tree.invalidate_paths_and_collect_futures(
+            vec![path.to_owned()],
+            self.sqlite_db.as_mut(),
+            &self.stats,
+        ) {
+            let _unused = soft_error!(
+                "materializer_declare_existing_invalidation_error",
+                error,
+                quiet: true
+            );
+        }
         on_materialization(
             self.sqlite_db.as_mut(),
             &self.subscriptions,
             path,
             &metadata,
             Utc::now(),
+            classification,
             "materializer_declare_existing_error",
         );
 
@@ -991,6 +1091,8 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
             path.iter().map(|f| f.to_owned()),
             Box::new(ArtifactMaterializationData {
                 deps: value.deps().duped(),
+                classification,
+                logical_size_bytes,
                 stage: ArtifactMaterializationStage::Materialized {
                     metadata,
                     last_access_time: Utc::now(),
@@ -999,6 +1101,8 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                 processing: Processing::Done(self.version_tracker.next()),
             }),
         );
+        self.stats
+            .add_materialized(classification, logical_size_bytes);
     }
 
     fn declare(
@@ -1082,9 +1186,11 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
         // Always invalidate materializer state before actual deleting from filesystem
         // so there will never be a moment where artifact is deleted but materializer
         // thinks it still exists.
-        let existing_futs = self
-            .tree
-            .invalidate_paths_and_collect_futures(vec![path.to_owned()], self.sqlite_db.as_mut());
+        let existing_futs = self.tree.invalidate_paths_and_collect_futures(
+            vec![path.to_owned()],
+            self.sqlite_db.as_mut(),
+            &self.stats,
+        );
 
         let existing_futs = ExistingFutures(existing_futs);
 
@@ -1125,6 +1231,8 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
 
         let data = Box::new(ArtifactMaterializationData {
             deps: value.deps().duped(),
+            classification: ArtifactClassification::IntermediateOnly,
+            logical_size_bytes: artifact_metadata_size(value.entry()),
             stage: ArtifactMaterializationStage::Declared {
                 entry: value.entry().dupe(),
                 method,
@@ -1650,6 +1758,7 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
                                 &artifact_path,
                                 &metadata,
                                 timestamp,
+                                info.classification,
                                 "materializer_finished_error",
                             );
 
@@ -1663,6 +1772,8 @@ impl<T: IoHandler> DeferredMaterializerCommandProcessor<T> {
 
                     if let Some(new_stage) = new_stage {
                         info.stage = new_stage;
+                        self.stats
+                            .add_materialized(info.classification, info.logical_size_bytes);
                     }
 
                     info.processing = Processing::Done(version);
@@ -1693,12 +1804,14 @@ fn on_materialization(
     path: &ProjectRelativePath,
     metadata: &ArtifactMetadata,
     timestamp: DateTime<Utc>,
+    classification: ArtifactClassification,
     error_name: &'static str,
 ) {
     if let Some(sqlite_db) = sqlite_db {
-        if let Err(e) = sqlite_db
-            .materializer_state_table()
-            .insert(path, metadata, timestamp)
+        if let Err(e) =
+            sqlite_db
+                .materializer_state_table()
+                .insert(path, metadata, timestamp, classification)
         {
             let _unused = soft_error!(error_name, e, quiet: true);
         }

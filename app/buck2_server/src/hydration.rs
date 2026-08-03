@@ -8,11 +8,19 @@
  * above-listed licenses.
  */
 
+//! The `buck2 debug hydration` command: manually page DICE node values out to
+//! disk, page them back in, or report paging status.
+//!
+//! The paging mechanism these subcommands drive — page-out itself, the
+//! single-flight/cancel state shared with automatic idle page-out, and the idle
+//! page-out scheduling — lives in [`crate::paging`].
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use buck2_cli_proto::HydrationSubcommand;
-use buck2_common::memory;
+use buck2_error::ErrorTag;
+use buck2_error::conversion::from_any_with_tag;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::partial_result_dispatcher::NoPartialResult;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
@@ -24,6 +32,10 @@ use dice::PagableStatus;
 use dupe::Dupe;
 
 use crate::ctx::ServerCommandContext;
+use crate::paging::cancel_active_page_out;
+use crate::paging::page_out;
+use crate::paging::page_out_in_progress;
+use crate::paging::wait_for_idle_page_out;
 
 pub(crate) async fn hydration_command(
     ctx: &ServerCommandContext<'_>,
@@ -33,7 +45,11 @@ pub(crate) async fn hydration_command(
     let dice = ctx.base_context.daemon.dice_manager.unsafe_dice().dupe();
     let subcommand = HydrationSubcommand::try_from(req.subcommand)?;
     run_server_command(
-        HydrationServerCommand { dice, subcommand },
+        HydrationServerCommand {
+            dice,
+            subcommand,
+            wait: req.wait,
+        },
         ctx,
         partial_result_dispatcher,
     )
@@ -43,6 +59,8 @@ pub(crate) async fn hydration_command(
 struct HydrationServerCommand {
     dice: Arc<Dice>,
     subcommand: HydrationSubcommand,
+    /// `status --wait`: block until any in-progress idle page-out finishes.
+    wait: bool,
 }
 
 #[async_trait]
@@ -70,16 +88,10 @@ impl ServerCommandTemplate for HydrationServerCommand {
     ) -> buck2_error::Result<Self::Response> {
         match self.subcommand {
             HydrationSubcommand::PageOut => {
-                self.dice.page_out().await.map_err(|e| {
-                    buck2_error::conversion::from_any_with_tag(
-                        e,
-                        buck2_error::ErrorTag::Environment,
-                    )
-                })?;
-                // metrics() blocks on the core-state thread, draining its FIFO
-                // queue, so the page-out evictions are processed before we purge.
-                let _ = self.dice.metrics();
-                memory::purge_jemalloc()?;
+                // A manual page-out supersedes any idle one; stop it first so they
+                // don't page the same graph out concurrently.
+                cancel_active_page_out();
+                page_out(&self.dice, || false).await?;
                 // Cross-restart persistence: page-out doubles as the snapshot
                 // save point when a snapshot path is configured. The next
                 // daemon (same env) loads it at construction.
@@ -129,18 +141,21 @@ impl ServerCommandTemplate for HydrationServerCommand {
                 Ok(buck2_cli_proto::HydrationResponse::default())
             }
             HydrationSubcommand::PageIn => {
-                self.dice.page_in().await.map_err(|e| {
-                    buck2_error::conversion::from_any_with_tag(
-                        e,
-                        buck2_error::ErrorTag::Environment,
-                    )
-                })?;
+                // Page-in wants values resident; stop any idle page-out racing it.
+                cancel_active_page_out();
+                self.dice
+                    .page_in()
+                    .await
+                    .map_err(|e| from_any_with_tag(e, ErrorTag::Environment))?;
                 Ok(buck2_cli_proto::HydrationResponse::default())
             }
             HydrationSubcommand::Status => {
+                if self.wait {
+                    wait_for_idle_page_out().await;
+                }
                 let status = self.dice.pagable_status().await;
                 Ok(buck2_cli_proto::HydrationResponse {
-                    summary: Some(format_status_summary(&status)),
+                    summary: Some(format_status_summary(&status, page_out_in_progress())),
                 })
             }
             HydrationSubcommand::DupStrings => {
@@ -241,7 +256,7 @@ mod tests {
     }
 }
 
-fn format_status_summary(status: &PagableStatus) -> String {
+fn format_status_summary(status: &PagableStatus, page_out_in_progress: bool) -> String {
     // `total_nodes` counts vacant/in-progress nodes too; the rest is "other".
     // saturating_sub guards an underflow the struct invariant already rules out.
     let other = status
@@ -249,9 +264,17 @@ fn format_status_summary(status: &PagableStatus) -> String {
         .saturating_sub(status.resident_count)
         .saturating_sub(status.paged_out_count);
     let mut summary = format!(
-        "DICE hydration: {} nodes ({} resident, {} paged out, {} other)\n",
-        status.total_nodes, status.resident_count, status.paged_out_count, other,
+        "DICE hydration: {} nodes ({} resident, {} paged out, {} other; {} page-out candidates)\n",
+        status.total_nodes,
+        status.resident_count,
+        status.paged_out_count,
+        other,
+        status.candidate_count,
     );
+    summary.push_str(&format!(
+        "idle page-out in progress: {}\n",
+        if page_out_in_progress { "yes" } else { "no" }
+    ));
     if !status.by_type.is_empty() {
         summary.push('\n');
         summary.push_str(&format!(

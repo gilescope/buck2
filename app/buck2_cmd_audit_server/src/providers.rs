@@ -23,7 +23,6 @@ use buck2_server_ctx::pattern_parse_and_resolve::parse_and_resolve_provider_labe
 use buck2_util::indent::indent;
 use dice::DiceComputations;
 use dice::DiceTransaction;
-use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
 
@@ -57,14 +56,15 @@ async fn server_execute_with_dice(
     command: &AuditProvidersCommand,
     server_ctx: &dyn ServerCommandContextTrait,
     mut stdout: PartialResultDispatcher<buck2_cli_proto::StdoutBytes>,
-    mut ctx: DiceTransaction,
+    ctx: DiceTransaction,
 ) -> buck2_error::Result<()> {
     let target_resolution_config =
-        audit_command_target_resolution_config(&mut ctx, &command.target_cfg, server_ctx).await?;
+        audit_command_target_resolution_config(&mut ctx.ctx(), &command.target_cfg, server_ctx)
+            .await?;
 
     let provider_labels_with_modifiers =
         parse_and_resolve_provider_labels_with_modifiers_from_cli_args(
-            &mut ctx,
+            &mut ctx.ctx(),
             &command.patterns,
             server_ctx.working_dir(),
         )
@@ -73,20 +73,18 @@ async fn server_execute_with_dice(
     let mut futs = Vec::new();
     for label_with_modifiers in provider_labels_with_modifiers {
         for configured_providers_label in target_resolution_config
-            .get_configured_provider_label_with_modifiers(&mut ctx, &label_with_modifiers)
+            .get_configured_provider_label_with_modifiers(&mut ctx.ctx(), &label_with_modifiers)
             .await?
         {
-            futs.push(DiceComputations::declare_closure(|ctx| {
-                async move {
-                    let result = ctx.get_providers(&configured_providers_label).await;
-                    (configured_providers_label, result)
-                }
-                .boxed()
+            futs.push(DiceComputations::declare_closure(async |ctx| {
+                let result = ctx.get_providers(&configured_providers_label).await;
+                (configured_providers_label, result)
             }));
         }
     }
 
-    let mut futs: FuturesOrdered<_> = ctx.compute_many(futs).into_iter().collect();
+    let mut dice = ctx.ctx();
+    let mut futs: FuturesOrdered<_> = dice.compute_many(futs).into_iter().collect();
 
     let mut stdout = stdout.as_writer();
     let mut stderr = server_ctx.stderr()?;

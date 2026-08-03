@@ -17,12 +17,13 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_interpreter::types::cell_root::CellRoot;
 use buck2_interpreter::types::project_root::StarlarkProjectRoot;
-use buck2_util::thin_box::ThinBoxSlice;
+use buck2_util::size_assert;
 use derive_more::Display;
 use display_container::fmt_container;
 use dupe::Dupe;
 use either::Either;
 use gazebo::prelude::*;
+use mini_vec::MiniBoxSlice;
 use pagable::Pagable;
 use pagable::PagableDeserialize;
 use pagable::PagableSerialize;
@@ -47,7 +48,6 @@ use starlark::values::ValueOfUnchecked;
 use starlark::values::ValueTypedComplex;
 use starlark::values::string::StarlarkStr;
 use starlark::values::type_repr::StarlarkTypeRepr;
-use static_assertions::assert_eq_size;
 
 use crate::interpreter::rule_defs::artifact::starlark_artifact_like::StarlarkInputArtifactLike;
 use crate::interpreter::rule_defs::artifact::starlark_output_artifact::StarlarkOutputArtifact;
@@ -273,33 +273,28 @@ enum FrozenCommandLineOption {
     Format(FrozenStringValue),
     Prepend(FrozenStringValue),
     Quote(#[starlark_pagable(pagable)] QuoteStyle),
-    // `ThinBoxSlice` lives in `buck2_util` (cannot depend on `starlark`),
-    // so the per-element starlark bridging lives here at the use site.
-    #[allow(clippy::box_collection)]
     Replacements(
         #[starlark_pagable(
-            serialize_with = "serialize_thinbox_starlark",
-            deserialize_with = "deserialize_thinbox_starlark"
+            serialize_with = "serialize_minibox_starlark",
+            deserialize_with = "deserialize_minibox_starlark"
         )]
-        ThinBoxSlice<(FrozenCmdArgsRegex, FrozenStringValue)>,
+        MiniBoxSlice<(FrozenCmdArgsRegex, FrozenStringValue)>,
     ),
 }
 
-assert_eq_size!(FrozenCommandLineOption, [usize; 2]);
+size_assert::words_of_type!(FrozenCommandLineOption, 2);
 
 #[derive(Debug, Default, Allocative, StarlarkPagable)]
 pub(crate) struct FrozenCommandLineOptions {
-    // `ThinBoxSlice` lives in `buck2_util` (cannot depend on `starlark`),
-    // so the per-element starlark bridging lives here at the use site.
     #[starlark_pagable(
-        serialize_with = "serialize_thinbox_starlark",
-        deserialize_with = "deserialize_thinbox_starlark"
+        serialize_with = "serialize_minibox_starlark",
+        deserialize_with = "deserialize_minibox_starlark"
     )]
-    options: ThinBoxSlice<FrozenCommandLineOption>,
+    options: MiniBoxSlice<FrozenCommandLineOption>,
 }
 
-fn serialize_thinbox_starlark<T: StarlarkSerialize + 'static>(
-    field: &ThinBoxSlice<T>,
+fn serialize_minibox_starlark<T: StarlarkSerialize + 'static>(
+    field: &MiniBoxSlice<T>,
     ctx: &mut dyn StarlarkSerializeContext,
 ) -> starlark::Result<()> {
     PagableSerialize::pagable_serialize(&field.len(), ctx.pagable())?;
@@ -309,21 +304,21 @@ fn serialize_thinbox_starlark<T: StarlarkSerialize + 'static>(
     Ok(())
 }
 
-fn deserialize_thinbox_starlark<T: StarlarkDeserialize + 'static>(
+fn deserialize_minibox_starlark<T: StarlarkDeserialize + 'static>(
     ctx: &mut dyn StarlarkDeserializeContext<'_>,
-) -> starlark::Result<ThinBoxSlice<T>> {
+) -> starlark::Result<MiniBoxSlice<T>> {
     let len = usize::pagable_deserialize(ctx.pagable())?;
     let mut items = Vec::with_capacity(len);
     for _ in 0..len {
         items.push(T::starlark_deserialize(ctx)?);
     }
-    Ok(ThinBoxSlice::from_iter(items))
+    Ok(MiniBoxSlice::from_iter(items))
 }
 
 impl FrozenCommandLineOptions {
     pub const fn empty() -> Self {
         FrozenCommandLineOptions {
-            options: ThinBoxSlice::empty(),
+            options: MiniBoxSlice::new(),
         }
     }
 
@@ -466,13 +461,13 @@ impl<'v> Freeze for CommandLineOptions<'v> {
         }
         if let Some(replacements) = replacements {
             if !replacements.is_empty() {
-                let replacements = ThinBoxSlice::from_iter((*replacements).freeze(freezer)?);
+                let replacements = MiniBoxSlice::from_iter((*replacements).freeze(freezer)?);
                 options.push(FrozenCommandLineOption::Replacements(replacements));
             }
         }
 
         Ok(FrozenCommandLineOptions {
-            options: ThinBoxSlice::from_iter(options),
+            options: MiniBoxSlice::from_iter(options),
         })
     }
 }

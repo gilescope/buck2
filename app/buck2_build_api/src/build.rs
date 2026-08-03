@@ -118,6 +118,14 @@ impl<T> ConfiguredBuildTargetResultGen<T> {
             .chain(self.errors.iter().map(|e| e.elapsed))
             .max()
     }
+
+    /// Whether this target hit the `--overall-timeout` deadline, as opposed to building
+    /// successfully or failing for some other reason.
+    pub fn timed_out(&self) -> bool {
+        self.errors
+            .iter()
+            .any(|e| e.inner.has_tag(buck2_error::ErrorTag::BuildDeadlineExpired))
+    }
 }
 
 pub type ConfiguredBuildTargetResult =
@@ -544,7 +552,7 @@ pub struct BuildConfiguredLabelOptions {
 
 pub async fn build_configured_label(
     event_consumer: &dyn BuildEventConsumer,
-    ctx: &LinearRecomputeDiceComputations<'_>,
+    ctx: LinearRecomputeDiceComputations<'_, '_>,
     materialization_and_upload: MaterializationAndUploadContext,
     providers_label: ConfiguredProvidersLabel,
     providers_to_build: &ProvidersToBuild,
@@ -569,14 +577,14 @@ pub async fn build_configured_label(
     }
 }
 
-async fn build_configured_label_inner<'a>(
+async fn build_configured_label_inner(
     event_consumer: &dyn BuildEventConsumer,
-    ctx: &'a LinearRecomputeDiceComputations<'_>,
+    ctx: LinearRecomputeDiceComputations<'_, '_>,
     materialization_and_upload: MaterializationAndUploadContext,
     providers_label: ConfiguredProvidersLabel,
     providers_to_build: &ProvidersToBuild,
     opts: BuildConfiguredLabelOptions,
-    timeout_observer: Option<&'a Arc<dyn LivelinessObserver>>,
+    timeout_observer: Option<&'_ Arc<dyn LivelinessObserver>>,
 ) -> buck2_error::Result<()> {
     let outputs = match get_outputs_for_top_level_target(
         &mut ctx.get(),
@@ -635,7 +643,7 @@ async fn build_configured_label_inner<'a>(
             tokio::task::unconstrained(KeepGoing::try_compute_join_all(
                 &mut ctx.get(),
                 outputs.iter(),
-                |ctx, (output, _type)| async move { output.resolved_artifact(ctx).await }.boxed(),
+                async |ctx, (output, _type)| output.resolved_artifact(ctx).await,
             ))
             .await?;
         let node_keys = resolved_artifacts

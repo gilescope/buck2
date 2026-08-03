@@ -19,6 +19,7 @@ use buck2_common::invocation_roots::find_invocation_roots;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
 #[cfg(fbcode_build)]
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
+use buck2_common::settings::parser::parse_settings;
 use buck2_core::buck2_env;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
@@ -40,9 +41,7 @@ struct ImmediateConfig {
     cwd_cell_alias_resolver: CellAliasResolver,
     daemon_startup_config: DaemonStartupConfig,
     #[cfg(fbcode_build)]
-    daemon_start_unsandboxed_via_wrapper: bool,
-    #[cfg(fbcode_build)]
-    show_sentiment: bool,
+    allow_daemon_start_unsandboxed_via_wrapper: bool,
 }
 
 impl ImmediateConfig {
@@ -50,6 +49,8 @@ impl ImmediateConfig {
     /// and without parsing any configs for any referenced cells. This means this function might return
     /// an empty mapping if the root `.buckconfig` does not contain the cell definitions.
     fn parse(roots: &InvocationRoots) -> buck2_error::Result<ImmediateConfig> {
+        let settings = parse_settings(&roots.project_root)?;
+
         // This function is non-reentrant, and blocking for a bit should be ok
         let cells = futures::executor::block_on(BuckConfigBasedCells::parse_with_config_args(
             &roots.project_root,
@@ -63,24 +64,16 @@ impl ImmediateConfig {
         Ok(ImmediateConfig {
             cell_resolver: cells.cell_resolver,
             cwd_cell_alias_resolver,
-            daemon_startup_config: DaemonStartupConfig::new(&cells.root_config)
+            daemon_startup_config: DaemonStartupConfig::new(&cells.root_config, &settings)
                 .buck_error_context("Error loading daemon startup config")?,
             #[cfg(fbcode_build)]
-            daemon_start_unsandboxed_via_wrapper: cells
+            allow_daemon_start_unsandboxed_via_wrapper: cells
                 .root_config
                 .parse::<bool>(BuckconfigKeyRef {
                     section: "buck2",
-                    property: "daemon_start_unsandboxed_via_wrapper",
+                    property: "allow_daemon_start_unsandboxed_via_wrapper",
                 })?
                 .unwrap_or(false),
-            #[cfg(fbcode_build)]
-            show_sentiment: cells
-                .root_config
-                .get(BuckconfigKeyRef {
-                    section: "experiments",
-                    property: "sentiment",
-                })
-                .is_some_and(|v| v == "true"),
         })
     }
 }
@@ -92,10 +85,8 @@ struct ImmediateConfigContextData {
     cwd_cell_alias_resolver: CellAliasResolver,
     daemon_startup_config: DaemonStartupConfig,
     #[cfg(fbcode_build)]
-    daemon_start_unsandboxed_via_wrapper: bool,
+    allow_daemon_start_unsandboxed_via_wrapper: bool,
     project_filesystem: ProjectRoot,
-    #[cfg(fbcode_build)]
-    show_sentiment: bool,
 }
 
 pub struct ImmediateConfigContext<'a> {
@@ -130,21 +121,16 @@ impl<'a> ImmediateConfigContext<'a> {
         Ok(&self.data()?.daemon_startup_config)
     }
 
-    pub fn daemon_start_unsandboxed_via_wrapper(&self) -> buck2_error::Result<bool> {
+    pub fn allow_daemon_start_unsandboxed_via_wrapper(&self) -> buck2_error::Result<bool> {
         #[cfg(fbcode_build)]
         {
-            Ok(self.data()?.daemon_start_unsandboxed_via_wrapper)
+            Ok(self.data()?.allow_daemon_start_unsandboxed_via_wrapper)
         }
 
         #[cfg(not(fbcode_build))]
         {
             Ok(false)
         }
-    }
-
-    #[cfg(fbcode_build)]
-    pub fn show_sentiment(&self) -> bool {
-        self.data().map(|d| d.show_sentiment).unwrap_or(false)
     }
 
     /// Resolves a cell path (i.e., contains `//`) into an absolute path. The cell path must have
@@ -215,10 +201,9 @@ impl<'a> ImmediateConfigContext<'a> {
                     cwd_cell_alias_resolver: cfg.cwd_cell_alias_resolver,
                     daemon_startup_config,
                     #[cfg(fbcode_build)]
-                    daemon_start_unsandboxed_via_wrapper: cfg.daemon_start_unsandboxed_via_wrapper,
+                    allow_daemon_start_unsandboxed_via_wrapper: cfg
+                        .allow_daemon_start_unsandboxed_via_wrapper,
                     project_filesystem: roots.project_root,
-                    #[cfg(fbcode_build)]
-                    show_sentiment: cfg.show_sentiment,
                 })
             })
             .buck_error_context("Error creating cell resolver")

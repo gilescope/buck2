@@ -229,7 +229,7 @@ impl std::fmt::Display for GatherPackageListingError {
         let (package, submessage) = match self {
             GatherPackageListingError::Error { package, .. } => {
                 // in this case we return the buck2_error as our source and we're just displayed as context
-                write!(f, "gathering package listing for `{}`", &package)?;
+                write!(f, "gathering package listing for `{}`", package)?;
                 return Ok(());
             }
             GatherPackageListingError::NoBuildFile {
@@ -327,7 +327,7 @@ impl std::fmt::Display for GatherPackageListingError {
                         "{}\n    dir `{}` does not exist (project.ignore contains `{}`)",
                         underlined(&path_as_str),
                         path_as_str,
-                        &pattern
+                        pattern
                     ),
                 )
             }
@@ -467,13 +467,10 @@ impl Directory {
             let mut subpackages = Vec::new();
 
             for res in ctx
-                .compute_join(subdirs, |ctx: &mut DiceComputations, path| {
-                    async move {
-                        let res = Directory::gather(ctx, buildfile_candidates, root, &path, false)
-                            .await?;
-                        Ok((path, res))
-                    }
-                    .boxed()
+                .compute_join(subdirs, async |ctx: &mut DiceComputations, path| {
+                    let res =
+                        Directory::gather(ctx, buildfile_candidates, root, &path, false).await?;
+                    Ok((path, res))
                 })
                 .await
             {

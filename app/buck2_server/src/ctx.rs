@@ -64,6 +64,7 @@ use buck2_core::facebook_only;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_core::pattern::pattern::InferTargetNames;
 use buck2_core::pattern::pattern::ParsedPattern;
 use buck2_core::pattern::pattern::ParsedPatternWithModifiers;
 use buck2_core::pattern::pattern_type::ConfiguredProvidersPatternExtra;
@@ -92,7 +93,7 @@ use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_fs::working_dir::AbsWorkingDir;
-use buck2_hash::StdBuckHashMap;
+use buck2_hash::IntentionallyStdHashMap;
 use buck2_hash::StdBuckHashSet;
 use buck2_interpreter::dice::starlark_debug::SetStarlarkDebugger;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
@@ -140,6 +141,7 @@ use crate::daemon::state::DaemonStateData;
 use crate::dice_tracker::BuckDiceTracker;
 use crate::heartbeat_guard::HeartbeatGuard;
 use crate::host_info;
+use crate::paging::PagingManager;
 use crate::profile_patterns::FileWritingProfileEventListener;
 use crate::profiling_manager::StarlarkProfilingManager;
 use crate::snapshot::SnapshotCollector;
@@ -228,6 +230,10 @@ pub struct ServerCommandContext<'a> {
     /// dropped.
     heartbeat_guard_handle: Option<HeartbeatGuard>,
 
+    /// Captures DICE paging telemetry at command start; emitted at command end
+    /// (see [`ServerCommandContext::finalize`]).
+    paging_manager: PagingManager,
+
     /// The current state of the certificate. This is used to detect errors due to invalid certs.
     cert_state: CertState,
 
@@ -263,6 +269,7 @@ impl<'a> ServerCommandContext<'a> {
         snapshot_collector: SnapshotCollector,
         cancellations: &'a CancellationContext,
         command_start: Instant,
+        total_disk_space_bytes: Option<u64>,
     ) -> buck2_error::Result<Self> {
         let working_dir = AbsNormPath::new(&client_context.working_dir)?;
 
@@ -336,6 +343,8 @@ impl<'a> ServerCommandContext<'a> {
         let heartbeat_guard_handle =
             HeartbeatGuard::new(base_context.events.dupe(), snapshot_collector);
 
+        let paging_manager = PagingManager::new(base_context.daemon.dupe(), total_disk_space_bytes);
+
         let debugger_handle = create_debugger_handle(base_context.events.dupe());
 
         Ok(ServerCommandContext {
@@ -360,6 +369,7 @@ impl<'a> ServerCommandContext<'a> {
             disable_starlark_types: client_context.disable_starlark_types,
             unstable_typecheck: client_context.unstable_typecheck,
             heartbeat_guard_handle: Some(heartbeat_guard_handle),
+            paging_manager,
             daemon_uuid_from_client: client_context.daemon_uuid.clone(),
             command_name: client_context.command_name.clone(),
             sanitized_argv: client_context.sanitized_argv.clone(),
@@ -475,11 +485,27 @@ impl<'a> ServerCommandContext<'a> {
     }
 
     // Called at the end of the command to perform any necessary final actions or cleanup.
-    pub(crate) async fn finalize(mut self) -> buck2_error::Result<()> {
+    pub(crate) async fn finalize(
+        mut self,
+        triggers_idle_page_out: bool,
+    ) -> buck2_error::Result<()> {
         self.starlark_profiling_manager
             .finalize(&self.base_context.events)
             .await?;
-        self.heartbeat_guard_handle.take().unwrap().finalize().await;
+
+        // The heartbeat guard's last snapshot; reused to gate idle page-out on disk
+        // headroom without a fresh stat.
+        let command_end_snapshot = self.heartbeat_guard_handle.take().unwrap().finalize().await;
+
+        // Emits this command's DICE paging telemetry and, if eligible, schedules an
+        // idle page-out.
+        self.paging_manager
+            .maybe_trigger_page_out_on_idle(
+                &self.base_context.events,
+                &command_end_snapshot,
+                triggers_idle_page_out,
+            )
+            .await;
         Ok(())
     }
 }
@@ -596,8 +622,11 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
         mut ctx: DiceTransactionUpdater,
         early_timings: &mut EarlyCommandTimingBuilder,
     ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
-        let existing_state = &mut ctx.existing_state().await.clone();
-        let cells_and_configs = self.cmd_ctx.load_new_configs(existing_state).await?;
+        let existing_state = ctx.existing_state().await.clone();
+        let cells_and_configs = self
+            .cmd_ctx
+            .load_new_configs(&mut existing_state.ctx())
+            .await?;
 
         // Validate agent context against buckconfig schema if entries were provided.
         if !self.cmd_ctx.agent_context.is_empty() {
@@ -616,9 +645,24 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             self.cmd_ctx.isolation_prefix.as_str(),
         )?;
 
-        existing_state.maybe_enable_detailed_aggregated_metrics(&cells_and_configs.root_config)?;
+        existing_state
+            .ctx()
+            .maybe_enable_detailed_aggregated_metrics(&cells_and_configs.root_config)?;
 
         let cell_resolver = cells_and_configs.cell_resolver;
+
+        let infer_target_names = if cells_and_configs
+            .root_config
+            .parse::<bool>(BuckconfigKeyRef {
+                section: "buck2",
+                property: "infer_target_names",
+            })?
+            .unwrap_or(false)
+        {
+            InferTargetNames::Yes
+        } else {
+            InferTargetNames::No
+        };
 
         let configuror = BuildInterpreterConfiguror::new(
             prelude_path(&cell_resolver)?,
@@ -627,6 +671,7 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             self.interpreter_xcode_version.clone(),
             self.cmd_ctx.record_target_call_stacks,
             self.cmd_ctx.skip_targets_with_duplicate_names,
+            infer_target_names,
             None,
             // New interner for each transaction.
             Arc::new(ConcurrentTargetLabelInterner::default()),
@@ -939,6 +984,10 @@ impl DiceCommandUpdater<'_, '_> {
             format!("miniperf:{}", enable_miniperf),
             format!("log-configured-graph-size:{}", log_configured_graph_size),
             "peak-load-metrics:v2".to_owned(),
+            format!(
+                "page-out-on-idle:{}",
+                self.cmd_ctx.base_context.daemon.page_out_on_idle.is_some()
+            ),
         ];
         tags.extend(CleanStaleConfig::adaptive_telemetry_tags(
             clean_stale_config.as_ref(),
@@ -960,14 +1009,14 @@ impl DiceCommandUpdater<'_, '_> {
     }
 }
 
-struct ConfigMetadataHolder(StdBuckHashMap<String, String>);
+struct ConfigMetadataHolder(IntentionallyStdHashMap<String, String>);
 
 fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComputationData) {
     // Facebook only: metadata collection for Scribe writes
     facebook_only();
 
     fn add_config(
-        map: &mut StdBuckHashMap<String, String>,
+        map: &mut IntentionallyStdHashMap<String, String>,
         cfg: &LegacyBuckConfig,
         key: BuckconfigKeyRef<'static>,
         field_name: &'static str,
@@ -989,7 +1038,7 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
         sample_json.get("normals")?.as_object().cloned()
     }
 
-    let mut metadata = StdBuckHashMap::default();
+    let mut metadata = IntentionallyStdHashMap::new();
 
     add_config(
         &mut metadata,
@@ -1166,7 +1215,9 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
     }
 
     /// Gathers metadata to attach to events for when a command starts and stops.
-    async fn request_metadata(&self) -> buck2_error::Result<StdBuckHashMap<String, String>> {
+    async fn request_metadata(
+        &self,
+    ) -> buck2_error::Result<IntentionallyStdHashMap<String, String>> {
         // Facebook only: metadata collection for Scribe writes
         facebook_only();
 
@@ -1193,6 +1244,11 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
                 "daemon_originating_cgroup".to_owned(),
                 originating_cgroup.clone(),
             );
+        }
+
+        #[cfg(all(fbcode_build, target_os = "linux"))]
+        if let Some(agent_identity) = identity_env::agent_identity_from_env() {
+            metadata.insert("daemon_agent_identity_from_env".to_owned(), agent_identity);
         }
 
         if let Some(oncall) = &self.oncall {
@@ -1229,7 +1285,7 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
     async fn config_metadata(
         &self,
         ctx: &mut DiceComputations<'_>,
-    ) -> buck2_error::Result<StdBuckHashMap<String, String>> {
+    ) -> buck2_error::Result<IntentionallyStdHashMap<String, String>> {
         ctx.per_transaction_data()
             .data
             .get::<ConfigMetadataHolder>()

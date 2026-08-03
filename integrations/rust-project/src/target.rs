@@ -61,7 +61,7 @@ impl Deref for Target {
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.0)
+        write!(f, "{}", self.0)
     }
 }
 
@@ -89,13 +89,20 @@ pub(crate) struct MacroOutput {
     pub(crate) actual: Target,
     pub(crate) dylib: PathBuf,
 }
+/// The kind of a Rust target, as reported by the `resolve_deps.bxl` prelude script.
+///
+/// This binary is shipped as a pinned prebuilt (via DotSlash) that is versioned
+/// independently of the prelude BXL it invokes, so a given binary may run against
+/// an older or newer prelude. Accept both the semantic kind names (`bin`/`lib`/`test`)
+/// emitted by newer preludes and the legacy fully-qualified rule types emitted by
+/// older ones.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) enum Kind {
-    #[serde(rename = "prelude//rules.bzl:rust_binary")]
+    #[serde(rename = "bin", alias = "prelude//rules.bzl:rust_binary")]
     Binary,
-    #[serde(rename = "prelude//rules.bzl:rust_library")]
+    #[serde(rename = "lib", alias = "prelude//rules.bzl:rust_library")]
     Library,
-    #[serde(rename = "prelude//rules.bzl:rust_test")]
+    #[serde(rename = "test", alias = "prelude//rules.bzl:rust_test")]
     Test,
 }
 
@@ -346,6 +353,25 @@ fn expand_atfile(path: &Path) -> Result<Vec<String>, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kind_deserializes_semantic_values() -> Result<(), serde_json::Error> {
+        for (value, expected) in [
+            (r#""bin""#, Kind::Binary),
+            (r#""lib""#, Kind::Library),
+            (r#""test""#, Kind::Test),
+            // Legacy fully-qualified rule types emitted by older preludes.
+            (r#""prelude//rules.bzl:rust_binary""#, Kind::Binary),
+            (r#""prelude//rules.bzl:rust_library""#, Kind::Library),
+            (r#""prelude//rules.bzl:rust_test""#, Kind::Test),
+        ] {
+            assert_eq!(serde_json::from_str::<Kind>(value)?, expected);
+        }
+
+        assert!(serde_json::from_str::<Kind>(r#""not_a_kind""#).is_err());
+
+        Ok(())
+    }
 
     #[test]
     fn test_cfg() {

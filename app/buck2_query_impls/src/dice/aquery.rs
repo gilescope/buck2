@@ -158,17 +158,20 @@ pub(crate) struct AqueryData {
 // than `(TransitiveSetKey, ProjectionIndex)`. We already have that information when constructing it and the
 // artifact side of it holds a starlark ref. That would allow someone with an ArtifactGroup to synchronously
 // traverse the tset graph rather than needing to asynchronously resolve a TransitiveSetKey.
-async fn convert_inputs<'c, 'a, Iter: IntoIterator<Item = &'a ArtifactGroup>>(
+async fn convert_inputs<
+    'c,
+    'a,
+    Iter: IntoIterator<Item = &'a ArtifactGroup, IntoIter: ExactSizeIterator>,
+>(
     ctx: &'c mut DiceComputations<'_>,
     node_cache: DiceAqueryNodesCache,
     inputs: Iter,
 ) -> buck2_error::Result<Vec<ActionInput>> {
-    let resolved_artifacts: Vec<_> = tokio::task::unconstrained(KeepGoing::try_compute_join_all(
-        ctx,
-        inputs,
-        |ctx, input| async move { input.resolved_artifact(ctx).await }.boxed(),
-    ))
-    .await?;
+    let resolved_artifacts: Vec<_> =
+        KeepGoing::try_compute_join_all(ctx, inputs, async |ctx, input| {
+            input.resolved_artifact(ctx).await
+        })
+        .await?;
 
     let (artifacts, projections): (Vec<_>, Vec<_>) = Itertools::partition_map(
         resolved_artifacts
@@ -184,10 +187,8 @@ async fn convert_inputs<'c, 'a, Iter: IntoIterator<Item = &'a ArtifactGroup>>(
     let mut deps =
         artifacts.into_map(|a| ActionInput::ActionKey(ActionQueryNodeRef::Action(a.dupe())));
     let projection_deps = ctx
-        .try_compute_join(projections, |ctx, key| {
-            let key = key.dupe();
-            let node_cache = node_cache.dupe();
-            async move { get_tset_node(node_cache, ctx, key).await }.boxed()
+        .try_compute_join(projections, async |ctx, key| {
+            get_tset_node(node_cache.dupe(), ctx, key.dupe()).await
         })
         .await?;
 

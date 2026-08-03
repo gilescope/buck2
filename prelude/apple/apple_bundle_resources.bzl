@@ -97,7 +97,7 @@ def get_apple_bundle_resource_part_list(ctx: AnalysisContext) -> AppleBundleReso
         )
 
     cxx_sanitizer_runtime_info = get_default_binary_dep(ctx.attrs.binary).get(CxxSanitizerRuntimeInfo) if ctx.attrs.binary else None
-    if cxx_sanitizer_runtime_info:
+    if cxx_sanitizer_runtime_info and get_extension_attr(ctx) != "appex":
         runtime_resource_spec = AppleResourceSpec(
             files = cxx_sanitizer_runtime_info.runtime_files,
             destination = AppleResourceDestination("frameworks"),
@@ -484,9 +484,10 @@ def _run_ibtool(
     ibtool_command.extend(action_flags)
     if output_is_dir:
         ibtool_command.append('"$TMPDIR"')
+        ibtool_command.append(cmd_args(raw_file, format = '"$EXEC_ROOT"/{}'))
     else:
         ibtool_command.append(output)
-    ibtool_command.append(raw_file)
+        ibtool_command.append(raw_file)
 
     if output_is_dir:
         # Sandboxing and fs isolation on RE machines results in Xcode tools failing
@@ -495,9 +496,10 @@ def _run_ibtool(
         # As a workaround create a directory in tmp, use it for Xcode tools, then
         # copy the result to buck-out.
         wrapper_script, _ = ctx.actions.write(
-            "ibtool_wrapper.sh",
+            "ibtool_wrapper_" + action_identifier.replace(" ", "_").replace("/", "_") + ".sh",
             [
                 cmd_args("set -euo pipefail"),
+                cmd_args('EXEC_ROOT="$PWD"'),
                 cmd_args('export TMPDIR="$(mktemp -d)"'),
                 cmd_args(cmd_args(ibtool_command), delimiter = " "),
                 cmd_args(output, format = 'mkdir -p {} && cp -r "$TMPDIR"/ {}'),
@@ -588,7 +590,7 @@ def _process_apple_resource_file_if_needed(
             _link_ui_resource(ctx = ctx, raw_file = compiled, output = processed.as_output(), target_device = "watch", output_is_dir = True)
         else:
             processed = compiled
-            _compile_ui_resource(ctx, file, processed.as_output())
+            _compile_ui_resource(ctx, file, processed.as_output(), output_is_dir = True)
     elif basename.endswith(".xib"):
         if destination_relative_path:
             destination_relative_path = paths.replace_extension(destination_relative_path, ".nib")

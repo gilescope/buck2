@@ -99,12 +99,7 @@ impl OwnedFrozenValue {
     /// use starlark::values::OwnedFrozenValue;
     /// let heap = FrozenHeap::new();
     /// let value = heap.alloc("test");
-    /// unsafe {
-    ///     OwnedFrozenValue::new(
-    ///         heap.into_ref_named(FrozenHeapName::User(Box::new("test"))),
-    ///         value,
-    ///     )
-    /// };
+    /// unsafe { OwnedFrozenValue::new(heap.into_ref_named(FrozenHeapName::user("test")), value) };
     /// ```
     pub unsafe fn new(owner: FrozenHeapRef, value: FrozenValue) -> Self {
         Self { owner, value }
@@ -220,7 +215,7 @@ impl PagableSerialize for OwnedFrozenValue {
         // serialization, so the offset maps may not exist yet when we
         // need to serialize the FrozenValue.
         let state = StarlarkSerializerImpl::get_or_create_state(serializer);
-        state.ensure_chunk_index_registered(&self.owner);
+        state.ensure_chunk_index_registered(&self.owner)?;
 
         let mut ctx = StarlarkSerializerImpl::new(serializer, state);
         ctx.serialize_frozen_value(self.value)
@@ -280,12 +275,7 @@ impl<T: for<'a> StarlarkValue<'a>> OwnedFrozenValueTyped<T> {
     /// use starlark::values::OwnedFrozenValue;
     /// let heap = FrozenHeap::new();
     /// let value = heap.alloc("test");
-    /// unsafe {
-    ///     OwnedFrozenValue::new(
-    ///         heap.into_ref_named(FrozenHeapName::User(Box::new("test"))),
-    ///         value,
-    ///     )
-    /// };
+    /// unsafe { OwnedFrozenValue::new(heap.into_ref_named(FrozenHeapName::user("test")), value) };
     /// ```
     pub unsafe fn new<'a>(owner: FrozenHeapRef, value: FrozenValueTyped<'a, T>) -> Self {
         // SAFETY: The caller has asserted that this heap ref keeps the value alive.

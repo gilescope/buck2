@@ -47,18 +47,18 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::api::key::InvalidationSourcePriority;
-use crate::impls::core::graph::nodes::ForceDirtyHistory;
-use crate::impls::core::graph::nodes::InjectedGraphNode;
-use crate::impls::core::graph::nodes::OccupiedGraphNode;
-use crate::impls::core::graph::nodes::VersionedGraphNode;
-use crate::impls::core::state::CoreStateHandle;
-use crate::impls::deps::graph::SeriesParallelDeps;
-use crate::impls::key::CowDiceKeyHashed;
-use crate::impls::key::DiceKey;
-use crate::impls::key::DiceKeyErased;
-use crate::impls::key_index::DiceKeyIndex;
-use crate::impls::storage::DiceStorage;
-use crate::impls::value::DiceValidValue;
+use crate::core::graph::nodes::ForceDirtyHistory;
+use crate::core::graph::nodes::InjectedGraphNode;
+use crate::core::graph::nodes::OccupiedGraphNode;
+use crate::core::graph::nodes::VersionedGraphNode;
+use crate::core::state::CoreStateHandle;
+use crate::deps::graph::SeriesParallelDeps;
+use crate::key::CowDiceKeyHashed;
+use crate::key::DiceKey;
+use crate::key::DiceKeyErased;
+use crate::key_index::DiceKeyIndex;
+use crate::storage::DiceStorage;
+use crate::value::DiceValidValue;
 use crate::versions::VersionNumber;
 use crate::versions::VersionRange;
 use crate::versions::VersionRanges;
@@ -114,25 +114,36 @@ impl PersistedVersionRanges {
                 .iter()
                 .map(|r| {
                     let (b, e) = r.parts_for_persist();
-                    (b.value() as u64, e.map(|e| e.value() as u64))
-                })
-                .collect(),
-        )
-    }
-
-    pub(crate) fn into_internal(self) -> VersionRanges {
-        VersionRanges::from_persisted_ranges(
-            self.0
-                .into_iter()
-                .map(|(b, e)| {
-                    VersionRange::from_persisted_parts(
-                        VersionNumber::new(b as usize),
-                        e.map(|e| VersionNumber::new(e as usize)),
+                    (
+                        b.value_for_persist() as u64,
+                        e.map(|e| e.value_for_persist() as u64),
                     )
                 })
                 .collect(),
         )
     }
+
+    pub(crate) fn into_internal(self) -> anyhow::Result<VersionRanges> {
+        Ok(VersionRanges::from_persisted_ranges(
+            self.0
+                .into_iter()
+                .map(|(b, e)| {
+                    Ok(VersionRange::from_persisted_parts(
+                        version_from_wire(b)?,
+                        e.map(version_from_wire).transpose()?,
+                    ))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ))
+    }
+}
+
+/// A version number read back from a snapshot. Zero is not a valid version (they
+/// start at [`VersionNumber::FIRST`]), so a zero means the file is corrupt - and
+/// the file is untrusted input.
+fn version_from_wire(v: u64) -> anyhow::Result<VersionNumber> {
+    VersionNumber::from_persisted_value(usize::try_from(v)?)
+        .ok_or_else(|| anyhow::anyhow!("corrupt snapshot: version number must be non-zero"))
 }
 
 /// `ForceDirtyHistory` on the wire. Load-bearing: the `restricted_range`
@@ -153,7 +164,10 @@ impl PersistedForceDirty {
                 priority: 1,
             },
             Some((versions, priority)) => PersistedForceDirty {
-                versions: versions.iter().map(|v| v.value() as u64).collect(),
+                versions: versions
+                    .iter()
+                    .map(|v| v.value_for_persist() as u64)
+                    .collect(),
                 priority: priority_to_wire(priority),
             },
         }
@@ -163,8 +177,8 @@ impl PersistedForceDirty {
         Ok(ForceDirtyHistory::from_persisted_parts(
             self.versions
                 .into_iter()
-                .map(|v| VersionNumber::new(v as usize))
-                .collect(),
+                .map(version_from_wire)
+                .collect::<anyhow::Result<Vec<_>>>()?,
             priority_from_wire(self.priority)?,
         ))
     }
@@ -343,17 +357,13 @@ enum SavedKey {
 fn save_key(storage: &DiceStorage, key: &DiceKeyErased, finished: &FinishedMap) -> SavedKey {
     match key {
         DiceKeyErased::Key(k) => {
-            match store_tagged_blob::<dyn crate::impls::key::DiceKeyDyn>(
-                storage,
-                k.as_ref(),
-                finished,
-            ) {
+            match store_tagged_blob::<dyn crate::key::DiceKeyDyn>(storage, k.as_ref(), finished) {
                 Some(dk) => SavedKey::Plain(dk),
                 None => SavedKey::Unpersistable,
             }
         }
         DiceKeyErased::Projection(p) => {
-            match store_tagged_blob::<dyn crate::impls::key::DiceProjectionDyn>(
+            match store_tagged_blob::<dyn crate::key::DiceProjectionDyn>(
                 storage,
                 p.proj_arc().as_ref(),
                 finished,
@@ -428,10 +438,10 @@ pub(crate) async fn save_snapshot(
                     None
                 } else {
                     match value {
-                        PersistValueExtract::Paged(dk) => Some(dk.0),
+                        PersistValueExtract::Paged(dk) => Some(dk.get()),
                         PersistValueExtract::Hydrated(v) => storage
                             .store_value_blob(key_erased, v.dupe(), &finished)?
-                            .map(|dk| dk.0),
+                            .map(|dk| dk.get()),
                     }
                 };
                 staged.push(Staged {
@@ -458,7 +468,7 @@ pub(crate) async fn save_snapshot(
                 } else {
                     storage
                         .store_value_blob(key_erased, value.dupe(), &finished)?
-                        .map(|dk| dk.0)
+                        .map(|dk| dk.get())
                 };
                 match (&saved_key, value_blob) {
                     (SavedKey::Plain(_), Some(vb)) => {
@@ -466,7 +476,7 @@ pub(crate) async fn save_snapshot(
                             dice_key: *key,
                             saved_key,
                             body: StagedBody::Injected {
-                                first_valid_version: first_valid_version.value() as u64,
+                                first_valid_version: first_valid_version.value_for_persist() as u64,
                                 priority: priority_to_wire(
                                     key_erased.invalidation_source_priority(),
                                 ),
@@ -492,9 +502,9 @@ pub(crate) async fn save_snapshot(
     fn plain_rank(s: &Staged) -> Option<(u8, u128)> {
         match (&s.saved_key, &s.body) {
             (SavedKey::Plain(dk), StagedBody::Occupied { value_blob, .. }) => {
-                Some((if value_blob.is_some() { 0 } else { 2 }, dk.0))
+                Some((if value_blob.is_some() { 0 } else { 2 }, dk.get()))
             }
-            (SavedKey::Plain(dk), StagedBody::Injected { .. }) => Some((1, dk.0)),
+            (SavedKey::Plain(dk), StagedBody::Injected { .. }) => Some((1, dk.get())),
             (SavedKey::Projection(..), _) => None,
             (SavedKey::Unpersistable, _) => unreachable!("filtered above"),
         }
@@ -520,7 +530,7 @@ pub(crate) async fn save_snapshot(
         _ => unreachable!(),
     });
     projections.sort_by_key(|s| match &s.saved_key {
-        SavedKey::Projection(dk, base) => (dk.0, ordinal_of[base]),
+        SavedKey::Projection(dk, base) => (dk.get(), ordinal_of[base]),
         _ => unreachable!(),
     });
     for (i, s) in projections.iter().enumerate() {
@@ -531,9 +541,9 @@ pub(crate) async fn save_snapshot(
     let mut records: Vec<Record> = Vec::with_capacity(all.len());
     for s in &all {
         let key = match &s.saved_key {
-            SavedKey::Plain(dk) => PersistedKey::Plain { blob: dk.0 },
+            SavedKey::Plain(dk) => PersistedKey::Plain { blob: dk.get() },
             SavedKey::Projection(dk, base) => PersistedKey::Projection {
-                proj_blob: dk.0,
+                proj_blob: dk.get(),
                 base: ordinal_of[base],
             },
             SavedKey::Unpersistable => unreachable!(),
@@ -582,7 +592,11 @@ pub(crate) async fn save_snapshot(
     storage.storage().flush()?;
 
     let meta = MetaFile {
-        header: SnapshotHeader::new(inputs_digest, records.len() as u64, version.value() as u64),
+        header: SnapshotHeader::new(
+            inputs_digest,
+            records.len() as u64,
+            version.value_for_persist() as u64,
+        ),
         records,
     };
     let bytes = encode(&meta)?;
@@ -613,7 +627,7 @@ pub(crate) async fn load_snapshot(
     if !meta.header.matches(&inputs_digest) {
         return Ok(None);
     }
-    let at_version = VersionNumber::new(meta.header.max_version as usize);
+    let at_version = version_from_wire(meta.header.max_version)?;
     let mut stats = PersistStats::default();
 
     // Pass 1: fetch + deserialize + intern every key. Plain keys resolve
@@ -625,10 +639,10 @@ pub(crate) async fn load_snapshot(
     for record in &meta.records {
         let loaded = match record.key() {
             PersistedKey::Plain { blob } => {
-                match fetch_and_deserialize::<dyn crate::impls::key::DiceKeyDyn>(
+                match fetch_and_deserialize::<dyn crate::key::DiceKeyDyn>(
                     storage,
                     &handle,
-                    pagable::DataKey(*blob),
+                    pagable::DataKey::from_key_value(*blob)?,
                 )
                 .await
                 {
@@ -642,18 +656,15 @@ pub(crate) async fn load_snapshot(
                     .and_then(|ix| dice_keys.get(ix).copied().flatten());
                 match (
                     base_key,
-                    fetch_and_deserialize::<dyn crate::impls::key::DiceProjectionDyn>(
+                    fetch_and_deserialize::<dyn crate::key::DiceProjectionDyn>(
                         storage,
                         &handle,
-                        pagable::DataKey(*proj_blob),
+                        pagable::DataKey::from_key_value(*proj_blob)?,
                     )
                     .await,
                 ) {
                     (Some(bk), Some(boxed)) => Some(DiceKeyErased::Projection(
-                        crate::impls::key::ProjectionWithBase::from_persisted_parts(
-                            bk,
-                            Arc::from(boxed),
-                        ),
+                        crate::key::ProjectionWithBase::from_persisted_parts(bk, Arc::from(boxed)),
                     )),
                     _ => None,
                 }
@@ -710,9 +721,9 @@ pub(crate) async fn load_snapshot(
                 }
                 let node = OccupiedGraphNode::new_paged_out_for_persist(
                     dice_key,
-                    pagable::DataKey(*value_blob),
+                    pagable::DataKey::from_key_value(*value_blob)?,
                     crate::arc::Arc::new(SeriesParallelDeps::serial_from_vec(dep_keys)),
-                    verified_ranges.clone().into_internal(),
+                    verified_ranges.clone().into_internal()?,
                     dirtied_history.clone().into_internal()?,
                 );
                 nodes.push((dice_key, VersionedGraphNode::Occupied(node)));
@@ -727,7 +738,10 @@ pub(crate) async fn load_snapshot(
                 // Injected leaves hydrate eagerly: their values are the
                 // baseline the first command's changed_to calls diff against.
                 let erased = erased_keys[i].as_ref().unwrap();
-                let value = match storage.hydrate(erased, pagable::DataKey(*value_blob)).await {
+                let value = match storage
+                    .hydrate(erased, pagable::DataKey::from_key_value(*value_blob)?)
+                    .await
+                {
                     Ok(v) => v,
                     Err(_) => {
                         stats.dropped_unserializable += 1;
@@ -736,7 +750,7 @@ pub(crate) async fn load_snapshot(
                 };
                 let node = InjectedGraphNode::new(
                     dice_key,
-                    VersionNumber::new(*first_valid_version as usize),
+                    version_from_wire(*first_valid_version)?,
                     value,
                     priority_from_wire(*priority)?,
                 );
@@ -750,12 +764,13 @@ pub(crate) async fn load_snapshot(
     Ok(Some(stats))
 }
 
-async fn fetch_and_deserialize<T: ?Sized>(
+async fn fetch_and_deserialize<T>(
     storage: &DiceStorage,
     handle: &PagableStorageHandle,
     data_key: pagable::DataKey,
 ) -> Option<Box<T>>
 where
+    T: ?Sized,
     for<'de> T: PagableBoxDeserialize<'de>,
 {
     let data = storage.storage().fetch_data(&data_key).await.ok()?;

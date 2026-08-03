@@ -30,6 +30,7 @@ pub use pagable_derive::pagable_tagged;
 pub use pagable_derive::pagable_typetag;
 pub use typetag::PagableRegisteredFor;
 pub use typetag::PagableTagged;
+pub use typetag::PagableTypeTag;
 
 pub mod arc_erase;
 pub mod context;
@@ -52,7 +53,6 @@ pub use impls::static_value;
 pub use impls::static_value::StaticBytes;
 pub use impls::static_value::StaticValue;
 pub use storage::data::DataKey;
-pub use storage::data::OptionalDataKey;
 pub use traits::Pagable;
 pub use traits::PagableBoxDeserialize;
 pub use traits::PagableCursor;

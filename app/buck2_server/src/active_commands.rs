@@ -40,6 +40,14 @@ pub fn active_commands() -> MutexGuard<'static, StdBuckHashMap<TraceId, ActiveCo
     ACTIVE_COMMANDS.lock()
 }
 
+/// Whether `trace_id` is the one and only active command. False if it isn't
+/// registered (e.g. an empty map), so callers must hold their own active-command
+/// guard when relying on this.
+pub fn is_only_active_command(trace_id: &TraceId) -> bool {
+    let active = ACTIVE_COMMANDS.lock();
+    active.len() == 1 && active.contains_key(trace_id)
+}
+
 /// Broadcasts an instant event, returns whether any subscribers were connected.
 pub fn broadcast_instant_event<E: Into<buck2_data::instant_event::Data> + Clone>(
     event: &E,
@@ -278,6 +286,7 @@ mod tests {
     use buck2_events::Event;
     use buck2_events::daemon_id::DaemonId;
     use buck2_events::source::ChannelEventSource;
+    use buck2_hash::IntentionallyStdHashMap;
 
     use super::*;
 
@@ -381,7 +390,7 @@ mod tests {
                 data: Some(
                     buck2_data::DiceStateSnapshot {
                         key_states: {
-                            let mut map = StdBuckHashMap::default();
+                            let mut map = IntentionallyStdHashMap::new();
                             map.insert(
                                 "BuildKey".to_owned(),
                                 buck2_data::DiceKeyState {

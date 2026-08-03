@@ -53,6 +53,7 @@ load("@prelude//apple/user:macos_transition.bzl", "macos_transition")
 load("@prelude//apple/user:resource_group_map.bzl", "resource_group_map_impl")
 load("@prelude//apple/user:target_sdk_version_transition.bzl", "apple_test_target_sdk_version_transition", "target_sdk_version_transition")
 load("@prelude//apple/user:watch_transition.bzl", "watch_transition")
+load("@prelude//apple/validation:required_reasons_tools.bzl", "RequiredReasonsToolsInfo", "required_reasons_tools_impl")
 load("@prelude//cxx:groups_types.bzl", "GroupFilterInfo", "Traversal")
 load("@prelude//cxx:headers.bzl", "CPrecompiledHeaderInfo", "HeaderMode")
 load("@prelude//cxx:link_groups_types.bzl", "LINK_GROUP_MAP_ATTR")
@@ -849,6 +850,7 @@ apple_package = prelude_rule(
             """,
             ),
             "ext": attrs.enum(ApplePackageExtension.values(), default = "ipa"),
+            "include_app_symbols": attrs.bool(default = False),
             "package_name": attrs.option(attrs.string(), default = None),
             "packager": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "packager_args": attrs.list(attrs.arg(), default = []),
@@ -954,7 +956,8 @@ apple_resource = prelude_rule(
                 default = None,
                 doc = """
                 Specifies the destination in the final application bundle where resource will be copied. Possible
-                 values: "resources", "frameworks", "executables", "plugins", "xpcservices".
+                 values: "resources", "frameworks", "executables", "plugins", "xpcservices", "loginitems",
+                 "launchagents" (macOS `Contents/Library/LaunchAgents`), "extensionkit_extensions".
             """,
             ),
             "codesign_on_copy": attrs.bool(
@@ -1188,6 +1191,7 @@ apple_toolchain = prelude_rule(
             # which requires setting up separate platform-specific aliases with the correct constraints.
             "placeholder_tool": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "platform_path": attrs.option(attrs.source(), default = None),  # Mark as optional until we remove `_internal_platform_path`
+            "required_reasons_tools": attrs.exec_dep(providers = [RequiredReasonsToolsInfo]),
             # Defines whether the Xcode project generator needs to check
             # that the selected Xcode version matches the one defined
             # by the `xcode_build_version` fields.
@@ -1212,6 +1216,27 @@ apple_toolchain = prelude_rule(
         | apple_common.apple_installer_arg()
     ),
     impl = apple_toolchain_impl,
+)
+
+required_reasons_tools = prelude_rule(
+    name = "required_reasons_tools",
+    docs = """
+        A `required_reasons_tools()` rule bundles the tools used to validate Apple
+        Required Reasons API (RRAPI) usage against a bundle's `.xcprivacy` privacy manifest.
+        It is referenced by `apple_toolchain()` and provides the per-target `analyzer`, the
+        bundle-level `validator`.
+    """,
+    examples = None,
+    further = None,
+    attrs = (
+        buck.contacts_arg()
+        | buck.labels_arg()
+        | {
+            "analyzer": attrs.exec_dep(providers = [RunInfo]),
+            "validator": attrs.exec_dep(providers = [RunInfo]),
+        }
+    ),
+    impl = required_reasons_tools_impl,
 )
 
 core_data_model = prelude_rule(
@@ -1370,6 +1395,9 @@ swift_toolchain = prelude_rule(
             # which requires setting up separate platform-specific aliases with the correct constraints.
             "placeholder_tool": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
             "platform_path": attrs.option(attrs.source(), default = None),
+            # Rollout flag (buckconfig-driven, mode-independent) that prioritizes
+            # latency-critical Swift module builds.
+            "prioritize_swift_critical_path": attrs.bool(default = False),
             "provide_swift_debug_info": attrs.bool(default = True),
             "resource_dir": attrs.option(attrs.source(), default = None),
             "runtime_paths_for_bundling": attrs.list(attrs.string(), default = []),
@@ -1520,6 +1548,7 @@ apple_tools = prelude_rule(
         "assemble_bundle": attrs.exec_dep(providers = [RunInfo]),
         "bundle_telemetry_logger": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
         "codesign_manifest_tree_postprocessor": attrs.exec_dep(providers = [RunInfo]),
+        "dedupe_swift_module_map": attrs.exec_dep(providers = [RunInfo]),
         "dry_codesign_tool": attrs.exec_dep(providers = [RunInfo]),
         "framework_sanitizer": attrs.exec_dep(providers = [RunInfo]),
         "info_plist_processor": attrs.exec_dep(providers = [RunInfo]),
@@ -1865,6 +1894,7 @@ apple_rules = struct(
     cxx_universal_executable = cxx_universal_executable,
     mockingbird_mock = mockingbird_mock,
     prebuilt_apple_framework = prebuilt_apple_framework,
+    required_reasons_tools = required_reasons_tools,
     resource_group_map = resource_group_map,
     scene_kit_assets = scene_kit_assets,
     swift_toolchain = swift_toolchain,

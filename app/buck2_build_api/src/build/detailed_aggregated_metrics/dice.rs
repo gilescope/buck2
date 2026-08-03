@@ -15,6 +15,7 @@ use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::deferred::key::DeferredHolderKey;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
+use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_data::ComputeDetailedAggregatedMetricsEnd;
 use buck2_data::ComputeDetailedAggregatedMetricsStart;
 use buck2_error::internal_error;
@@ -23,7 +24,6 @@ use dice::DiceComputations;
 use dice::DiceDataBuilder;
 use dice::UserComputationData;
 use dupe::Dupe;
-use futures::FutureExt;
 
 use crate::build::BuildProviderType;
 use crate::build::detailed_aggregated_metrics::buck2_sketches::ArtifactPathSketches;
@@ -67,6 +67,7 @@ pub trait HasDetailedAggregatedMetrics {
         events: &PerBuildEvents,
         artifact_fs: ArtifactFs,
         providers_to_skip: HashSet<BuildProviderType>,
+        skip_targets: &HashSet<ConfiguredProvidersLabel>,
         sketch_count: bool,
         sketch_size: bool,
     ) -> impl Future<Output = buck2_error::Result<ArtifactPathSketchResult>> + Send;
@@ -139,38 +140,37 @@ impl HasDetailedAggregatedMetrics for DiceComputations<'_> {
         events: &PerBuildEvents,
         artifact_fs: ArtifactFs,
         providers_to_skip: HashSet<BuildProviderType>,
+        skip_targets: &HashSet<ConfiguredProvidersLabel>,
         sketch_count: bool,
         sketch_size: bool,
     ) -> buck2_error::Result<ArtifactPathSketchResult> {
+        let targets: Vec<&TopLevelTargetSpec> = events
+            .top_level_targets
+            .iter()
+            .filter(|spec| !skip_targets.contains(&spec.label))
+            .collect();
         let results = self
-            .compute_join(events.top_level_targets.iter(), |ctx, spec| {
-                let label = spec.label.clone();
-                let outputs = spec.outputs.dupe();
-                let artifact_fs = artifact_fs.clone();
-                let providers_to_skip = providers_to_skip.clone();
-                async move {
-                    match compute_artifact_path_sketches_for_target(
-                        ctx,
-                        &outputs,
-                        &artifact_fs,
-                        &providers_to_skip,
-                        sketch_size,
-                        sketch_count,
-                    )
-                    .await
-                    {
-                        Ok(sketches) => Ok((label, sketches)),
-                        Err(e) => {
-                            let _ignored = buck2_core::soft_error!(
-                                "artifact_path_sketch_computation_error",
-                                e,
-                                quiet: true
-                            );
-                            Ok((label, ArtifactPathSketches::empty()))
-                        }
+            .compute_join(targets, async |ctx, spec| {
+                match compute_artifact_path_sketches_for_target(
+                    ctx,
+                    &spec.outputs,
+                    &artifact_fs,
+                    &providers_to_skip,
+                    sketch_size,
+                    sketch_count,
+                )
+                .await
+                {
+                    Ok(sketches) => Ok((spec.label.dupe(), sketches)),
+                    Err(e) => {
+                        let _ignored = buck2_core::soft_error!(
+                            "artifact_path_sketch_computation_error",
+                            e,
+                            quiet: true
+                        );
+                        Ok((spec.label.dupe(), ArtifactPathSketches::empty()))
                     }
                 }
-                .boxed()
             })
             .await;
 

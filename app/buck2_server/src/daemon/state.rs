@@ -101,6 +101,7 @@ use crate::daemon::io_provider::create_io_provider;
 use crate::daemon::panic::DaemonStatePanicDiceDump;
 use crate::daemon::server::BuckdServerInitPreferences;
 use crate::daemon::tenting_provider::create_tenting_acl_provider;
+use crate::paging::PageOutThresholds;
 
 /// For a buckd process there is a single DaemonState created at startup and never destroyed.
 #[derive(Allocative)]
@@ -216,6 +217,15 @@ pub struct DaemonStateData {
     pub named_semaphores_for_run_actions: Arc<NamedSemaphores>,
 
     pub buckconfig_metadata: StdBuckHashMap<String, String>,
+
+    /// Idle page-out config: the resource-pressure thresholds, `Some` iff
+    /// `buck2_hydration.page_out_on_idle` is enabled (a `DaemonStartupConfig`, so
+    /// fixed for the daemon's lifetime). Read per command in `finalize` to decide
+    /// whether to schedule a background page-out; `None` disables it.
+    pub(crate) page_out_on_idle: Option<PageOutThresholds>,
+
+    /// Running more than one automatic idle page-out during this daemon's lifetime.
+    pub(crate) allow_multiple_idle_page_outs: bool,
 }
 
 impl DaemonStateData {
@@ -621,7 +631,13 @@ impl DaemonState {
 
             tracing::info!("Constructing DICE...");
             let dice = init_ctx
-                .construct_dice(io.dupe(), digest_config, root_config, tenting_acl_provider)
+                .construct_dice(
+                    io.dupe(),
+                    digest_config,
+                    root_config,
+                    tenting_acl_provider,
+                    paths.dice_state_path().as_ref(),
+                )
                 .await?;
 
             tracing::info!("Creating file watcher...");
@@ -752,6 +768,21 @@ impl DaemonState {
                 daemon_originating_cgroup: init_ctx.daemon_originating_cgroup,
                 named_semaphores_for_run_actions: Arc::new(NamedSemaphores::new()),
                 buckconfig_metadata: parse_buckconfig_metadata(root_config),
+                // `Some` (with thresholds) iff idle page-out is enabled; `None`
+                // otherwise. Defaults live in `HydrationConfig::from_config`, not here.
+                page_out_on_idle: init_ctx
+                    .daemon_startup_config
+                    .hydration
+                    .as_ref()
+                    .filter(|h| h.page_out_on_idle)
+                    .map(|h| PageOutThresholds {
+                        min_free_disk_gb: h.page_out_min_free_disk_gb,
+                    }),
+                allow_multiple_idle_page_outs: init_ctx
+                    .daemon_startup_config
+                    .hydration
+                    .as_ref()
+                    .is_some_and(|h| h.allow_multiple_idle_page_outs),
             }))
         };
         let daemon_listener_span = tracing::Span::current();
@@ -1027,6 +1058,7 @@ async fn http_client_from_startup_config(
 mod tests {
 
     use buck2_common::legacy_configs::configs::testing::parse;
+    use buck2_common::settings::BuckSettings;
     use indoc::indoc;
 
     use super::*;
@@ -1071,7 +1103,7 @@ mod tests {
             )],
             "config",
         )?;
-        let startup_config = DaemonStartupConfig::new(&config)?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty())?;
         let builder = http_client_from_startup_config(&startup_config).await?;
         assert_eq!(5, builder.max_redirects().unwrap());
         assert_eq!(Some(Duration::from_millis(10)), builder.connect_timeout());
@@ -1099,7 +1131,7 @@ mod tests {
             )],
             "config",
         )?;
-        let startup_config = DaemonStartupConfig::new(&config)?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty())?;
         let builder = http_client_from_startup_config(&startup_config).await?;
         assert_eq!(None, builder.connect_timeout());
         assert_eq!(

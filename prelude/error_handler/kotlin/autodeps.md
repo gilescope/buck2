@@ -1,23 +1,21 @@
----
-llms-gk: 'autodeps_md'
-oncalls: ['android_devxx']
-apply_to_regex: '^(?!.*/(?:wearables?|smartglasses)/).*\.(java|kt)$'
-apply_to_clients: ['vscode']
-tools: ['AutodepsTool']
----
+## MANDATORY: Run autodeps After Import Changes
 
-## MANDATORY: Run AutodepsTool After Import Changes
+**CRITICAL**: When you add or modify import statements in `.java` or `.kt` files, you **MUST run autodeps to update the BUCK dependencies BEFORE you validate or build**.
 
-**CRITICAL**: When you add or modify import statements in `.java` or `.kt` files, you **MUST run `AutodepsTool` BEFORE `validate_changes`**.
+## Command
 
-## Tool Parameters
+Run:
 
-Call `AutodepsTool` with:
+```
+xplat/tools/autodeps2 --languages android --ignore-lint-config <ABSOLUTE_OR_REPO_RELATIVE_PATH_TO_FILE>
+```
 
-- `file_path`: Absolute path to the modified Java/Kotlin file
-- `remove_unused_deps`: **Always set to `false`**
+(Equivalently, `meta android.build autodeps --file-path <file>`.)
 
-## When to Use AutodepsTool
+- Pass the path to the modified Java/Kotlin file.
+- **Never** pass `--remove-deps` — only add dependencies, never remove them.
+
+## When to Use
 
 **ALWAYS run immediately after:**
 
@@ -30,41 +28,39 @@ Call `AutodepsTool` with:
 ### ✅ CORRECT Order
 
 ```
-1. Add/modify/remove import statement in File.java
-2. Run AutodepsTool on the file
+1. Add/modify import statement in File.kt
+2. Run: xplat/tools/autodeps2 --languages android --ignore-lint-config <path to File.kt>
 3. Wait for completion
-4. Run validate_changes
+4. Validate or build
 ```
 
 ### ❌ WRONG Order
 
 ```
 1. Add import statement
-2. Run validate_changes
+2. Validate or build   (deps not yet updated → "unresolved reference")
 ```
 
 ## Example
 
 After adding this import:
 
-```java
-import com.facebook.litho.Component;
+```kotlin
+import com.facebook.litho.Component
 ```
 
-**Immediately call:**
+**Immediately run:**
 
 ```
-AutodepsTool(
-  file_path="/data/sandcastle/boxes/fbsource/fbandroid/java/com/instagram/feed/FeedRenderer.java",
-  remove_unused_deps=false
-)
+xplat/tools/autodeps2 --languages android --ignore-lint-config \
+  fbandroid/java/com/instagram/feed/FeedRenderer.kt
 ```
 
-**Then** run `validate_changes`.
+**Then** validate or build.
 
 ## Prohibitions
 
-- ❌ **Never skip `AutodepsTool`** after import changes
-- ❌ **Never run `validate_changes` before `AutodepsTool`**
-- ⚠️ **Never manually edit BUCK files for non-resource dependencies** - use `AutodepsTool` instead. Manual BUCK edits are ONLY allowed for adding resource (`R`) dependencies (see the `android_r_resource_lookup` skill for details).
-- ❌ **Never set `remove_unused_deps=true`** - only add dependencies, never remove
+- ❌ **Never skip autodeps** after import changes
+- ❌ **Never validate or build before running autodeps**
+- ⚠️ **Never manually edit BUCK files for non-resource dependencies** — run autodeps instead. Manual BUCK edits are ONLY allowed for adding resource (`R`) dependencies (see the `android_r_resource_lookup` skill for details).
+- ❌ **Never pass `--remove-deps`** — only add dependencies, never remove

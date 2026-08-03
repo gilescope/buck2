@@ -38,16 +38,32 @@ pub enum HydrationCommand {
 }
 
 #[derive(Debug, clap::Parser)]
-pub struct PageOutCommand;
+pub struct PageOutCommand {
+    #[clap(flatten)]
+    event_log_opts: CommonEventLogOptions,
+}
 
 #[derive(Debug, clap::Parser)]
-pub struct PageInCommand;
+pub struct PageInCommand {
+    #[clap(flatten)]
+    event_log_opts: CommonEventLogOptions,
+}
 
 #[derive(Debug, clap::Parser)]
-pub struct StatusCommand;
+pub struct StatusCommand {
+    /// Block until any in-progress idle page-out finishes before reporting.
+    #[clap(long)]
+    wait: bool,
+
+    #[clap(flatten)]
+    event_log_opts: CommonEventLogOptions,
+}
 
 #[derive(Debug, clap::Parser)]
-pub struct DupStringsCommand;
+pub struct DupStringsCommand {
+    #[clap(flatten)]
+    event_log_opts: CommonEventLogOptions,
+}
 
 impl HydrationCommand {
     fn subcommand(&self) -> HydrationSubcommand {
@@ -56,6 +72,15 @@ impl HydrationCommand {
             HydrationCommand::PageIn(_) => HydrationSubcommand::PageIn,
             HydrationCommand::Status(_) => HydrationSubcommand::Status,
             HydrationCommand::DupStrings(_) => HydrationSubcommand::DupStrings,
+        }
+    }
+
+    fn wait(&self) -> bool {
+        match self {
+            HydrationCommand::Status(c) => c.wait,
+            HydrationCommand::PageOut(_)
+            | HydrationCommand::PageIn(_)
+            | HydrationCommand::DupStrings(_) => false,
         }
     }
 }
@@ -82,6 +107,7 @@ impl StreamingCommand for HydrationCommand {
                 HydrationRequest {
                     context: Some(context),
                     subcommand: self.subcommand().into(),
+                    wait: self.wait(),
                 },
                 events_ctx,
                 ctx.console_interaction_stream(self.console_opts()),
@@ -101,7 +127,12 @@ impl StreamingCommand for HydrationCommand {
     }
 
     fn event_log_opts(&self) -> &CommonEventLogOptions {
-        CommonEventLogOptions::default_ref()
+        match self {
+            HydrationCommand::PageOut(c) => &c.event_log_opts,
+            HydrationCommand::PageIn(c) => &c.event_log_opts,
+            HydrationCommand::Status(c) => &c.event_log_opts,
+            HydrationCommand::DupStrings(c) => &c.event_log_opts,
+        }
     }
 
     fn build_config_opts(&self) -> &CommonBuildConfigurationOptions {

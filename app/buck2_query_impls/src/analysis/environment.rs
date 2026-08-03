@@ -61,7 +61,6 @@ use buck2_query_parser::BinaryOp;
 use dice::DiceComputations;
 use dupe::Dupe;
 use dupe::IterDupedExt;
-use futures::FutureExt;
 use pagable::StaticStr;
 use starlark::values::UnpackValue;
 
@@ -252,7 +251,15 @@ impl QueryEnvironment for ConfiguredGraphQueryEnvironment<'_> {
         visit: impl FnMut(Self::Target) -> buck2_error::Result<()> + Send,
         depth: u32,
     ) -> buck2_error::Result<()> {
-        async_depth_limited_traversal(&NodeLookupId, root.iter(), delegate, visit, depth).await
+        async_depth_limited_traversal(
+            &NodeLookupId,
+            root.iter(),
+            delegate,
+            visit,
+            depth,
+            self.allow_partial_graph(),
+        )
+        .await
     }
 
     async fn owner(&self, _paths: &FileSet) -> buck2_error::Result<TargetSet<Self::Target>> {
@@ -345,7 +352,7 @@ async fn get_template_info_provider_artifacts(
 pub(crate) async fn get_from_template_placeholder_info(
     ctx: &mut DiceComputations<'_>,
     template_name: StaticStr,
-    targets: impl IntoIterator<Item = ConfiguredTargetLabel>,
+    targets: impl IntoIterator<Item = ConfiguredTargetLabel, IntoIter: ExactSizeIterator>,
 ) -> buck2_error::Result<BuckIndexMap<ConfiguredTargetLabel, Artifact>> {
     let mut label_to_artifact: BuckIndexMap<ConfiguredTargetLabel, Artifact> =
         BuckIndexMap::default();
@@ -368,18 +375,14 @@ pub(crate) async fn get_from_template_placeholder_info(
     // Artifacts are put here to keep them in the correct order in the output, tsets are top-level tset nodes that we need
     // to traverse.
     let artifacts = ctx
-        .try_compute_join(targets, |ctx, target| {
-            async move {
-                let artifacts =
-                    get_template_info_provider_artifacts(ctx, &target, template_name.as_str())
-                        .await?;
-                buck2_error::Ok(
-                    artifacts
-                        .into_iter()
-                        .map(move |artifact| (target.dupe(), artifact)),
-                )
-            }
-            .boxed()
+        .try_compute_join(targets, async |ctx, target| {
+            let artifacts =
+                get_template_info_provider_artifacts(ctx, &target, template_name.as_str()).await?;
+            buck2_error::Ok(
+                artifacts
+                    .into_iter()
+                    .map(move |artifact| (target.dupe(), artifact)),
+            )
         })
         .await?;
     let mut artifacts: VecDeque<_> = artifacts.into_iter().flatten().collect();

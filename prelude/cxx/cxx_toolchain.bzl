@@ -46,6 +46,7 @@ load(
     "@prelude//linking:shared_libraries.bzl",
     "SharedLibraryInfo",
 )
+load("@prelude//target_stats:target_stats_tools.bzl", "TargetStatsToolsInfo")
 load("@prelude//utils:utils.bzl", "flatten", "value_or")
 
 def cxx_toolchain_impl(ctx):
@@ -277,12 +278,14 @@ def cxx_toolchain_impl(ctx):
         raw_headers_as_headers_mode = RawHeadersAsHeadersMode(ctx.attrs.raw_headers_as_headers_mode) if ctx.attrs.raw_headers_as_headers_mode != None else None,
         rc_compiler_info = rc_info,
         remap_cwd = ctx.attrs.remap_cwd,
+        materialize_external_debug_info = ctx.attrs.materialize_external_debug_info,
         split_debug_mode = SplitDebugMode(ctx.attrs.split_debug_mode),
         strip_flags_info = strip_flags_info,
         minimum_os_version = ctx.attrs.minimum_os_version,
         # TODO(T138705365): Turn on dep files by default
         use_dep_files = value_or(ctx.attrs.use_dep_files, _get_default_use_dep_files(platform_name)),
         default_deps = ctx.attrs.default_deps,
+        target_stats_tools = ctx.attrs.target_stats_tools[TargetStatsToolsInfo] if ctx.attrs.target_stats_tools else None,
     )
 
 def cxx_toolchain_extra_attributes(is_toolchain_rule):
@@ -326,6 +329,7 @@ def cxx_toolchain_extra_attributes(is_toolchain_rule):
         "llvm_cgdata": attrs.option(dep_type(providers = [RunInfo]), default = None),
         "llvm_link": attrs.option(dep_type(providers = [RunInfo]), default = None),
         "lto_mode": attrs.enum(LtoMode.values(), default = "none"),
+        "materialize_external_debug_info": attrs.bool(default = True),
         # Darwin only: the deployment target to use for this build
         "minimum_os_version": attrs.option(attrs.string(), default = None),
         "nm": dep_type(providers = [RunInfo]),
@@ -359,6 +363,7 @@ def cxx_toolchain_extra_attributes(is_toolchain_rule):
         "supports_distributed_thinlto": attrs.bool(default = False),
         "supports_shared_libraries": attrs.bool(default = True),
         "supports_two_phase_compilation": attrs.bool(default = False),
+        "target_stats_tools": attrs.option(dep_type(providers = [TargetStatsToolsInfo]), default = None),
         "thin_lto_double_codegen_enabled": attrs.bool(default = False),
         "thin_lto_premerger_enabled": attrs.bool(default = False),
         "use_archiver_flags": attrs.bool(default = True),

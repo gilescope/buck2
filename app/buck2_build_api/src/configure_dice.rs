@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use buck2_common::dice::cells::SetCellResolver;
@@ -24,6 +26,7 @@ use buck2_execute::digest_config::SetDigestConfig;
 use dice::DetectCycles;
 use dice::Dice;
 use dice::DiceStorage;
+use dice::PagableStorageBackend;
 
 use crate::actions::execute::dice_data::SetInvalidationTrackingConfig;
 use crate::build::detailed_aggregated_metrics::dice::SetDetailedAggregatedMetricsHandle;
@@ -59,6 +62,10 @@ pub async fn configure_dice_for_buck(
     root_config: Option<&LegacyBuckConfig>,
     detect_cycles: Option<DetectCycles>,
     tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
+    // Path to open pagable DICE storage at, or `None` to leave paging disabled.
+    dice_state_path: Option<&Path>,
+    // On-disk backend for pagable storage (`buck2_hydration.pagable_storage_backend`).
+    pagable_storage_backend: PagableStorageBackend,
 ) -> buck2_error::Result<Arc<Dice>> {
     let detect_cycles = detect_cycles.map_or_else(
         || {
@@ -93,11 +100,21 @@ pub async fn configure_dice_for_buck(
     // Empty handle; a command enables the tracker lazily if it needs one.
     dice.set_detailed_aggregated_metrics_handle(DetailedAggregatedMetricsHandle::new());
 
-    // Opt-in pagable storage. When `BUCK2_DICE_DB_PATH` is set, configures a
-    // `DiceStorage` backend, configured by `PAGABLE_STORAGE_BACKEND` so `Dice::page_out()`
-    // (e.g. via `buck2 debug hydration page-out`) can serialize node values to disk.
-    if let Ok(path) = std::env::var("BUCK2_DICE_DB_PATH") {
-        let storage = DiceStorage::open(std::path::Path::new(&path)).map_err(|e| {
+    // Opt-in pagable storage, enabling `Dice::page_out()` to serialize node
+    // values to disk (backend chosen by `pagable_storage_backend`) via `buck2
+    // debug hydration`. `dice_state_path` is `Some` when
+    // `buck2_hydration.enable_paging` is set (its value is the default path,
+    // under buck-out). The `BUCK2_DICE_DB_PATH` override (used by benchmarks)
+    // takes precedence and picks the path.
+    let db_path: Option<PathBuf> = match std::env::var_os("BUCK2_DICE_DB_PATH") {
+        Some(path) => Some(PathBuf::from(path)),
+        None => dice_state_path.map(Path::to_path_buf),
+    };
+    if let Some(path) = db_path {
+        let backend = pagable_storage_backend.with_env_override().map_err(|e| {
+            buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Environment)
+        })?;
+        let storage = DiceStorage::open(&path, backend).map_err(|e| {
             buck2_error::conversion::from_any_with_tag(e, buck2_error::ErrorTag::Environment)
         })?;
         dice.set_pagable_storage(storage);

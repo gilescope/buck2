@@ -237,9 +237,10 @@ impl<T: StreamingCommand> BuckSubcommand for T {
                 ctx.restarter.apply_to_constraints(&mut req);
                 BuckdConnectOptions::Options(BuckdConnectDaemonOptions {
                     constraints: req,
-                    daemon_start_unsandboxed_via_wrapper: ctx
+                    #[cfg(all(fbcode_build, target_os = "linux"))]
+                    allow_daemon_start_unsandboxed_via_wrapper: ctx
                         .immediate_config
-                        .daemon_start_unsandboxed_via_wrapper()?,
+                        .allow_daemon_start_unsandboxed_via_wrapper()?,
                 })
             };
             let buckd = match ctx.start_in_process_daemon.take() {

@@ -8,8 +8,10 @@
  * above-listed licenses.
  */
 
+use std::borrow::Cow;
 use std::env;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
@@ -71,6 +73,12 @@ use crate::immediate_config::ImmediateConfigContext;
 use crate::startup_deadline::StartupDeadline;
 use crate::subscribers::classify_server_stderr::classify_server_stderr;
 use crate::subscribers::stdout_stderr_forwarder::StdoutStderrForwarder;
+
+#[cfg(all(fbcode_build, target_os = "linux"))]
+mod linux_unsandbox;
+
+#[cfg(all(fbcode_build, target_os = "linux"))]
+use self::linux_unsandbox::get_unix_daemon_and_args;
 
 /// The client side matcher for DaemonConstraints.
 #[derive(Clone, Debug)]
@@ -238,12 +246,14 @@ pub struct BuckdConnectDaemonOptions {
     /// it with the wrapper command and the canonical daemon executable:
     ///
     /// ```text
-    /// /usr/local/bin/buck2 unsandbox-daemon <daemon-exe> --isolation-dir <dir> daemon ...
+    /// /usr/local/bin/buck unsandbox-daemon <daemon-exe> --isolation-dir <dir> daemon ...
     /// ```
     ///
-    /// This _only_ works if the wrapper is installed at `/usr/local/bin/buck2`,
+    /// This _only_ works if the wrapper is installed at `/usr/local/bin/buck`,
     /// as the BPFJailer policy only allows executables with that path the
-    /// ability to exit the jail.
+    /// ability to exit the jail. Wrappers that support the `unsandbox-daemon`
+    /// are installed setuid-root, and must be from a release build on or after
+    /// 20260630.
     ///
     /// The wrapper owns the privileged/sandbox-specific part of the flow: it
     /// validates that the requested executable is the Buck daemon associated
@@ -258,7 +268,8 @@ pub struct BuckdConnectDaemonOptions {
     /// intentionally constructed only around Buck's normal `daemon` argv, so
     /// enabling this option should not create a general mechanism for
     /// unsandboxing arbitrary Buck commands or user-provided executables.
-    pub(crate) daemon_start_unsandboxed_via_wrapper: bool,
+    #[cfg(all(fbcode_build, target_os = "linux"))]
+    pub(crate) allow_daemon_start_unsandboxed_via_wrapper: bool,
 }
 
 async fn get_channel(
@@ -314,6 +325,22 @@ pub fn buckd_startup_init_timeout() -> buck2_error::Result<Duration> {
     Ok(Duration::from_secs(
         buck2_env!("BUCKD_STARTUP_INIT_TIMEOUT", type=u64)?.unwrap_or(90),
     ))
+}
+
+struct ExecutableAndArgs<'a> {
+    executable: OsString,
+    args: Vec<Cow<'a, str>>,
+}
+
+#[cfg(not(all(fbcode_build, target_os = "linux")))]
+async fn get_unix_daemon_and_args<'a>(
+    _options: &BuckdConnectDaemonOptions,
+    args: Vec<&'a str>,
+) -> buck2_error::Result<ExecutableAndArgs<'a>> {
+    Ok(ExecutableAndArgs {
+        executable: get_daemon_exe()?.into_os_string(),
+        args: args.into_iter().map(Cow::Borrowed).collect(),
+    })
 }
 
 /// Responsible for starting the daemon when no daemon is running.
@@ -389,35 +416,8 @@ impl<'a> BuckdLifecycle<'a> {
             // On Unix we spawn a process which forks and exits, and here we wait for that spawned
             // process to terminate. That process is usually the Buck daemon executable, but may be
             // the installed Buck wrapper, which runs the daemon on our behalf after unsandboxing it.
-            let daemon_exe = get_daemon_exe()?;
-            let canonical_daemon_exe;
-            let certificate_has_agent_identity = {
-                #[cfg(fbcode_build)]
-                {
-                    identity::agent_identity_from_env().is_some()
-                }
-
-                #[cfg(not(fbcode_build))]
-                {
-                    false
-                }
-            };
-            let (executable, args) =
-                if options.daemon_start_unsandboxed_via_wrapper && certificate_has_agent_identity {
-                    canonical_daemon_exe = daemon_exe
-                        .canonicalize()
-                        .buck_error_context("Failed to canonicalize Buck daemon executable")?
-                        .into_os_string()
-                        .into_string()
-                        .map_err(|_| {
-                            internal_error!("Buck daemon executable path is not valid UTF-8")
-                        })?;
-                    args.insert(0, canonical_daemon_exe.as_str());
-                    args.insert(0, "unsandbox-daemon");
-                    ("/usr/local/bin/buck2".into(), args)
-                } else {
-                    (daemon_exe.into_os_string(), args)
-                };
+            let ExecutableAndArgs { executable, args } =
+                get_unix_daemon_and_args(options, args).await?;
 
             self.start_server_unix(
                 executable,
@@ -451,8 +451,8 @@ impl<'a> BuckdLifecycle<'a> {
 
     async fn start_server_unix(
         &self,
-        executable: std::ffi::OsString,
-        args: Vec<&str>,
+        executable: OsString,
+        args: Vec<Cow<'_, str>>,
         daemon_env_vars: &[(&OsStr, &OsStr)],
         daemon_startup_config: &DaemonStartupConfig,
         daemon_id: &DaemonId,
@@ -469,9 +469,9 @@ impl<'a> BuckdLifecycle<'a> {
             .unwrap_or_default();
         let unit_name = format!(
             "buck2-daemon.{}.{}.{}",
-            &repo_name,
+            repo_name,
             self.paths.isolation.as_str(),
-            &daemon_id,
+            daemon_id,
         );
 
         let (cmd, resource_control_args) = create_daemon_spawn_command(
@@ -485,8 +485,8 @@ impl<'a> BuckdLifecycle<'a> {
 
         cmd.current_dir(project_dir.root())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .args(args);
+            .stderr(std::process::Stdio::piped());
+        cmd.args(args.iter().map(Cow::as_ref));
 
         cmd.arg(daemon_startup_config.serialize()?);
 
@@ -535,7 +535,12 @@ impl<'a> BuckdLifecycle<'a> {
                     )?;
                     // This should return immediately as kill() waits for the process to end. We wait here again to fetch the ExitStatus
                     // Signal termination is not considered a success, so wait() results in an appropriate ExitStatus
-                    buck2_error::Ok(child.wait().await?)
+                    buck2_error::Ok(
+                        child
+                            .wait()
+                            .await
+                            .buck_error_context("Daemon startup timed out")?,
+                    )
                 }
                 Ok(result) => result.map_err(buck2_error::Error::from),
             }
@@ -849,9 +854,16 @@ async fn establish_connection_inner(
                             ))
                             .await?;
 
-                        hard_kill_until(&buckd_info.info, &deadline)
-                            .await
-                            .map_err(|error| BuckdConnectError::DaemonKillFailed { error })?;
+                        // The recorded daemon is unusable either way, so start a new one rather
+                        // than leaving buckd.info in place for the next invocation to trip over.
+                        if let Err(error) = hard_kill_until(&buckd_info.info, &deadline).await {
+                            events_ctx
+                                .eprintln(&format!(
+                                    "{}",
+                                    BuckdConnectError::DaemonKillFailed { error }
+                                ))
+                                .await?;
+                        }
 
                         reason
                     }

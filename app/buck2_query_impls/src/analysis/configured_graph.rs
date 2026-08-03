@@ -31,7 +31,6 @@ use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use dupe::IterDupedExt;
 use dupe::OptionDupedExt;
-use futures::FutureExt;
 use pagable::Pagable;
 use pagable::StaticStr;
 use pagable::pagable_typetag;
@@ -40,7 +39,7 @@ use crate::analysis::environment::ConfiguredGraphQueryEnvironmentDelegate;
 use crate::analysis::environment::get_from_template_placeholder_info;
 
 pub(crate) struct AnalysisDiceQueryDelegate<'c, 'd> {
-    pub(crate) ctx: &'c LinearRecomputeDiceComputations<'d>,
+    pub(crate) ctx: LinearRecomputeDiceComputations<'c, 'd>,
 }
 
 impl AnalysisDiceQueryDelegate<'_, '_> {
@@ -90,30 +89,21 @@ impl ConfiguredGraphQueryEnvironmentDelegate for AnalysisConfiguredGraphQueryDel
             ) -> Self::Value {
                 let (targets, label_to_artifact) = {
                     ctx.try_compute2(
-                        |ctx| {
-                            async move {
-                                ctx.try_compute_join(self.targets.iter(), |ctx, target| {
-                                    async move {
-                                        ctx.get_configured_target_node(target)
-                                            .await
-                                            .require_compatible()
-                                    }
-                                    .boxed()
-                                })
-                                .await
-                            }
-                            .boxed()
+                        async |ctx| {
+                            ctx.try_compute_join(self.targets.iter(), async |ctx, target| {
+                                ctx.get_configured_target_node(target)
+                                    .await
+                                    .require_compatible()
+                            })
+                            .await
                         },
-                        |ctx| {
-                            async move {
-                                get_from_template_placeholder_info(
-                                    ctx,
-                                    self.template_name,
-                                    self.targets.iter().duped(),
-                                )
-                                .await
-                            }
-                            .boxed()
+                        async |ctx| {
+                            get_from_template_placeholder_info(
+                                ctx,
+                                self.template_name,
+                                self.targets.iter().duped(),
+                            )
+                            .await
                         },
                     )
                     .await?

@@ -523,8 +523,8 @@ pub(crate) async fn gather_deps(
     }
 
     let dep_results = ctx
-        .compute_join(traversal.deps.iter(), |ctx, v| {
-            async move { ctx.get_internal_configured_target_node(v.0.target()).await }.boxed()
+        .compute_join(traversal.deps.iter(), async |ctx, v| {
+            ctx.get_internal_configured_target_node(v.0.target()).await
         })
         .await;
 
@@ -855,44 +855,32 @@ async fn compute_configured_target_node_no_transition(
     let toolchain_deps = &gathered_deps.toolchain_deps;
     let exec_deps = &gathered_deps.exec_deps;
 
-    let get_toolchain_deps = DiceComputations::declare_closure(move |ctx| {
-        async move {
-            ctx.compute_join(
-                toolchain_deps,
-                |ctx, target: &TargetConfiguredTargetLabel| {
-                    async move {
-                        ctx.get_internal_configured_target_node(
-                            &target.with_exec_cfg(execution_platform_cfg.cfg().dupe()),
-                        )
-                        .await
-                    }
-                    .boxed()
-                },
-            )
-            .await
-        }
-        .boxed()
+    let get_toolchain_deps = DiceComputations::declare_closure(async move |ctx| {
+        ctx.compute_join(
+            toolchain_deps,
+            async |ctx, target: &TargetConfiguredTargetLabel| {
+                ctx.get_internal_configured_target_node(
+                    &target.with_exec_cfg(execution_platform_cfg.cfg().dupe()),
+                )
+                .await
+            },
+        )
+        .await
     });
 
-    let get_exec_deps = DiceComputations::declare_closure(|ctx| {
-        async move {
-            ctx.compute_join(exec_deps, |ctx, (target, check_visibility)| {
-                async move {
-                    // Apply modifiers to exec_dep before configuring
-                    let result = configure_exec_dep_with_modifiers(
-                        ctx,
-                        target.target().unconfigured(),
-                        execution_platform_cfg.cfg(),
-                    )
-                    .await;
+    let get_exec_deps = DiceComputations::declare_closure(async |ctx| {
+        ctx.compute_join(exec_deps, async |ctx, (target, check_visibility)| {
+            // Apply modifiers to exec_dep before configuring
+            let result = configure_exec_dep_with_modifiers(
+                ctx,
+                target.target().unconfigured(),
+                execution_platform_cfg.cfg(),
+            )
+            .await;
 
-                    (result, *check_visibility)
-                }
-                .boxed()
-            })
-            .await
-        }
-        .boxed()
+            (result, *check_visibility)
+        })
+        .await
     });
 
     let (toolchain_dep_results, exec_dep_results): (Vec<_>, Vec<_>) =
@@ -1155,7 +1143,7 @@ impl LookingUpConfiguredNodeContext {
 impl std::fmt::Display for LookingUpConfiguredNodeContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.len == 1 {
-            write!(f, "Error looking up configured node {}", &self.target)?;
+            write!(f, "Error looking up configured node {}", self.target)?;
         } else {
             writeln!(
                 f,

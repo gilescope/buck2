@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use derive_more::Display;
+use pagable::Pagable;
 use pagable::PagableDeserialize;
 use pagable::PagableSerialize;
 use starlark_derive::NoSerialize;
@@ -36,6 +37,11 @@ use crate as starlark;
 use crate::const_frozen_string;
 use crate::environment::GlobalFrozenHeapName;
 use crate::environment::GlobalsBuilder;
+use crate::environment::MethodFrozenHeapName;
+use crate::pagable::error::PagableError;
+use crate::pagable::heap_ref_id::HeapRefId;
+use crate::pagable::starlark_serialize_context::StarlarkSerState;
+use crate::singleton_heap_name;
 use crate::starlark_simple_value;
 use crate::values::FrozenHeap;
 use crate::values::FrozenHeapRef;
@@ -48,8 +54,17 @@ use crate::values::dict::globals::register_dict;
 use crate::values::layout::heap::heap_type::FrozenHeapName;
 use crate::values::list::globals::register_list;
 
+pagable::static_str!(TEST_EVAL_HEAP_NAME = "test_eval");
+pagable::static_str!(TESTING_GLOBALS_HEAP_NAME = "testing");
+pagable::static_str!(CROSS_THREAD_GLOBALS_HEAP_NAME = "cross_thread");
+pagable::static_str!(BENCH_EVAL_HEAP_NAME = "bench_eval");
+pagable::static_str!(TEST_BCINSTRS_HEAP_NAME = "test_bcinstrs");
+pagable::static_str!(TEST_BCINSTRS_DET_GLOBALS_HEAP_NAME = "test_bcinstrs_det_globals");
+pagable::static_str!(METHOD_TEST_HEAP_NAME = "method_test");
+
 /// Private test heap name for pagable tests.
-#[derive(Clone, derive_more::Display, Debug, Hash, StrongHash)]
+#[derive(Clone, derive_more::Display, Debug, Hash, StrongHash, Pagable)]
+#[pagable::pagable_typetag(crate::values::UserHeapName)]
 #[display("TestHeapName({})", _0)]
 struct TestHeapName(String);
 
@@ -110,6 +125,61 @@ fn round_trip_heap_ref(heap_ref: &FrozenHeapRef) -> crate::Result<FrozenHeapRef>
     Ok(restored)
 }
 
+fn round_trip_heap_name(name: &FrozenHeapName) -> crate::Result<FrozenHeapName> {
+    let mut ser = pagable::testing::TestingSerializer::new();
+    name.pagable_serialize(&mut ser)
+        .map_err(crate::Error::new_other)?;
+    let bytes = ser.finish();
+
+    let mut de = pagable::testing::TestingDeserializer::new(&bytes);
+    FrozenHeapName::pagable_deserialize(&mut de).map_err(crate::Error::new_other)
+}
+
+#[test]
+fn test_frozen_heap_name_round_trip() -> crate::Result<()> {
+    let names = [
+        FrozenHeapName::Global(GlobalFrozenHeapName {
+            name: TEST_EVAL_HEAP_NAME,
+        }),
+        FrozenHeapName::Method(MethodFrozenHeapName {
+            name: METHOD_TEST_HEAP_NAME,
+        }),
+        FrozenHeapName::Singleton(singleton_heap_name!()),
+        TestHeapName::heap_name("user_test"),
+    ];
+
+    for name in names {
+        let expected_id = HeapRefId::from_heap_name(&name);
+        let expected_display = name.to_string();
+        let restored = round_trip_heap_name(&name)?;
+        assert_eq!(HeapRefId::from_heap_name(&restored), expected_id);
+        assert_eq!(restored.to_string(), expected_display);
+
+        if let FrozenHeapName::User(user) = restored {
+            assert_eq!(
+                user.as_any().downcast_ref::<TestHeapName>().unwrap().0,
+                "user_test"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_frozen_heap_ref_round_trip_preserves_name() -> crate::Result<()> {
+    let heap = FrozenHeap::new();
+    heap.alloc("value");
+    let heap_ref = heap.into_ref_named(TestHeapName::heap_name("preserved_name"));
+    let expected_id = HeapRefId::from_heap_name(heap_ref.name().unwrap());
+
+    let restored = round_trip_heap_ref(&heap_ref)?;
+    let restored_name = restored.name().expect("heap name should round-trip");
+    assert_eq!(HeapRefId::from_heap_name(restored_name), expected_id);
+    assert_eq!(restored_name.to_string(), "TestHeapName(preserved_name)");
+    Ok(())
+}
+
 #[test]
 fn test_module_eval_round_trip() -> crate::Result<()> {
     use std::any::TypeId;
@@ -135,7 +205,9 @@ a.append(a)
 "#;
 
     let ast = AstModule::parse("test_module.star", code.to_owned(), &Dialect::Extended)?;
-    let globals = GlobalsBuilder::new().build_named(GlobalFrozenHeapName { name: "test_eval" });
+    let globals = GlobalsBuilder::new().build_named(GlobalFrozenHeapName {
+        name: TEST_EVAL_HEAP_NAME,
+    });
     let frozen_module = Module::with_temp_heap(|module| {
         {
             let mut eval = Evaluator::new(&module);
@@ -573,8 +645,11 @@ fn test_heap_ref_dedup_round_trip() -> crate::Result<()> {
 /// for every registered header, regardless of cross-heap address mixing.
 #[test]
 fn test_ser_state_lookup_resolves_cross_heap_ptrs() -> crate::Result<()> {
+    use std::mem;
+
     use crate::pagable::heap_ref_id::HeapRefId;
     use crate::pagable::starlark_serialize_context::StarlarkSerState;
+    use crate::values::layout::heap::repr::AValueHeader;
 
     // Enough values to push each heap into multiple chunks (geometric
     // chunk sizes 512, 1024, ... → ~500 SimpleData spans 3-5 chunks).
@@ -654,10 +729,16 @@ fn test_ser_state_lookup_resolves_cross_heap_ptrs() -> crate::Result<()> {
     assert!(b_chunks >= 2, "heap B should span >= 2 chunks");
     assert!(c_chunks >= 2, "heap C should span >= 2 chunks");
 
-    let state = StarlarkSerState::new();
-    state.ensure_chunk_index_registered(&heap_a_ref);
-    state.ensure_chunk_index_registered(&heap_b_ref);
-    state.ensure_chunk_index_registered(&heap_c_ref);
+    let state = Arc::new(StarlarkSerState::new());
+    state
+        .ensure_chunk_index_registered(&heap_a_ref)
+        .expect("register heap A chunk index");
+    state
+        .ensure_chunk_index_registered(&heap_b_ref)
+        .expect("register heap B chunk index");
+    state
+        .ensure_chunk_index_registered(&heap_c_ref)
+        .expect("register heap C chunk index");
 
     for (heap_id, ptrs) in [
         (heap_a_id, &heap_a_ptrs),
@@ -672,6 +753,16 @@ fn test_ser_state_lookup_resolves_cross_heap_ptrs() -> crate::Result<()> {
             assert_eq!(
                 got_index, expected_index as u32,
                 "ptr {raw_ptr:#x}: got value_index {got_index}, expected {expected_index}",
+            );
+            let resident_value = state
+                .lookup_resident_value(heap_id, expected_index as u32, false)
+                .unwrap_or_else(|| {
+                    panic!("value_index {expected_index} missing from resident heap {heap_id:?}")
+                });
+            assert_eq!(
+                resident_value.ptr_value().ptr_value_untagged() + mem::size_of::<AValueHeader>(),
+                raw_ptr,
+                "value_index {expected_index} resolved to the wrong resident allocation",
             );
         }
     }
@@ -693,6 +784,33 @@ fn test_ser_state_lookup_resolves_cross_heap_ptrs() -> crate::Result<()> {
     assert_eq!(state.lookup_ptr(b_ref_c_ptr), Some((heap_b_id, 1)));
 
     Ok(())
+}
+
+#[test]
+fn test_heap_registration_rejects_different_ser_state() {
+    let heap = FrozenHeap::new();
+    heap.alloc_simple(SimpleData {
+        flag: true,
+        count: 1,
+    });
+    let heap_ref = heap.into_ref_named(TestHeapName::heap_name("single_ser_state"));
+
+    let first_state = Arc::new(StarlarkSerState::new());
+    first_state
+        .ensure_chunk_index_registered(&heap_ref)
+        .expect("register heap in first state");
+    first_state
+        .ensure_chunk_index_registered(&heap_ref)
+        .expect("repeat registration in the same state");
+
+    let second_state = Arc::new(StarlarkSerState::new());
+    let error = second_state
+        .ensure_chunk_index_registered(&heap_ref)
+        .expect_err("registration in a different state should fail");
+    assert!(matches!(
+        error.downcast_ref::<PagableError>(),
+        Some(PagableError::HeapRegisteredWithDifferentSerState),
+    ));
 }
 
 #[test]
@@ -1261,7 +1379,7 @@ fn test_frozen_record_type_round_trip() -> crate::Result<()> {
     let heap_ref = heap.into_ref_named(TestHeapName::heap_name("test_frozen_record_type"));
     // SAFETY: heap_ref owns the arena hosting root.
     let owned = unsafe { OwnedFrozenValue::new(heap_ref, root) };
-    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(&owned)?;
+    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(owned)?;
 
     let tuple: &crate::values::types::tuple::value::FrozenTuple = restored
         .value()
@@ -1622,7 +1740,7 @@ fn test_with_starlark_context_arc_dedup_round_trip() -> crate::Result<()> {
     let heap_ref = heap.into_ref_named(TestHeapName::heap_name("test_with_starlark_context_arc"));
     // SAFETY: heap_ref owns the arena hosting root.
     let owned = unsafe { OwnedFrozenValue::new(heap_ref, root) };
-    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(&owned)?;
+    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(owned)?;
 
     let tuple: &crate::values::types::tuple::value::FrozenTuple = restored
         .value()
@@ -1717,7 +1835,7 @@ fn test_arc_blanket_round_trip() -> crate::Result<()> {
     let heap_ref = heap.into_ref_named(TestHeapName::heap_name("test_arc_blanket"));
     // SAFETY: heap_ref owns the arena hosting root.
     let owned = unsafe { OwnedFrozenValue::new(heap_ref, root) };
-    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(&owned)?;
+    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(owned)?;
 
     let tuple: &crate::values::types::tuple::value::FrozenTuple = restored
         .value()
@@ -2307,7 +2425,9 @@ fn test_globals_roundtrip() {
         register_dict(globals);
     });
 
-    let globals = globals.build_named(GlobalFrozenHeapName { name: "testing" });
+    let globals = globals.build_named(GlobalFrozenHeapName {
+        name: TESTING_GLOBALS_HEAP_NAME,
+    });
 
     let mut serializer = pagable::testing::TestingSerializer::new();
     globals.pagable_serialize(&mut serializer).unwrap();
@@ -2315,9 +2435,10 @@ fn test_globals_roundtrip() {
 
 /// Round-trip an `OwnedFrozenValue` through `SerializerForPaging` +
 /// `InMemoryPagableStorage` + `PagableDeserializerImpl` (the real concrete
-/// impls used in production, not the testing ones).
+/// impls used in production, not the testing ones). Consumes and drops the
+/// source before page-in so the serialized heap is reconstructed.
 fn round_trip_owned_frozen_value_pagable_ser_de_impl(
-    owned: &OwnedFrozenValue,
+    owned: OwnedFrozenValue,
 ) -> crate::Result<OwnedFrozenValue> {
     use std::any::TypeId;
 
@@ -2344,6 +2465,7 @@ fn round_trip_owned_frozen_value_pagable_ser_de_impl(
             .page_out_item(data, arcs, &finished, session_ctx)
             .map_err(crate::Error::new_other)?
     };
+    drop(owned);
 
     let top_data = storage
         .fetch_arc_or_data_blocking(&TypeId::of::<()>(), &top_key)
@@ -2377,7 +2499,8 @@ fn test_cross_heap_frozen_value_round_trip_via_storage() -> crate::Result<()> {
 
     // SAFETY: `main_heap_ref` keeps the arena hosting `ref_fv` alive.
     let owned = unsafe { OwnedFrozenValue::new(main_heap_ref, ref_fv) };
-    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(&owned)?;
+    drop(dep_heap_ref);
+    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(owned)?;
 
     let undrop_headers = restored.owner().collect_undrop_headers_ordered();
     assert_eq!(undrop_headers.len(), 1);
@@ -2430,7 +2553,7 @@ fn test_with_starlark_context_arc_dedup_round_trip_via_storage() {
     // SAFETY: `heap_ref` keeps the arena hosting `outer_a_fv` alive.
     let owned = unsafe { OwnedFrozenValue::new(heap_ref, outer_a_fv) };
     let restored =
-        round_trip_owned_frozen_value_pagable_ser_de_impl(&owned).expect("round-trip via storage");
+        round_trip_owned_frozen_value_pagable_ser_de_impl(owned).expect("round-trip via storage");
 
     // Partial deser: only the root `OuterArcValue` (and its transitive deps)
     // is materialized. The second `OuterArcValue`, which is unreachable from
@@ -2573,7 +2696,7 @@ fn test_partial_deser_skips_unreachable_values() -> crate::Result<()> {
 
     // SAFETY: `heap_ref` keeps the arena alive.
     let owned = unsafe { OwnedFrozenValue::new(heap_ref, reachable_fv) };
-    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(&owned)?;
+    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(owned)?;
 
     let undrop = restored.owner().collect_undrop_headers_ordered();
     // Only the reachable SimpleData is materialized; the other two are skipped.
@@ -2604,7 +2727,7 @@ fn test_partial_deser_materializes_in_demand_order() -> crate::Result<()> {
 
     // SAFETY: `heap_ref` keeps the arena alive.
     let owned = unsafe { OwnedFrozenValue::new(heap_ref, root_fv) };
-    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(&owned)?;
+    let restored = round_trip_owned_frozen_value_pagable_ser_de_impl(owned)?;
 
     let undrop = restored.owner().collect_undrop_headers_ordered();
     assert_eq!(undrop.len(), 2);
@@ -2671,6 +2794,58 @@ fn deser_owned_frozen_value_from_storage(
         .expect("top-level key should return data, not a cached arc");
     let mut de = PagableDeserializerImpl::new(&top_data.data, &top_data.arcs, handle);
     OwnedFrozenValue::pagable_deserialize(&mut de).map_err(crate::Error::new_other)
+}
+
+/// X and Y point into the same heap. After X is paged out and its owner is
+/// dropped, Y keeps that heap resident. Paging X back in must reuse Y's heap
+/// and X's original allocation instead of reconstructing a duplicate heap.
+#[test]
+fn test_page_in_reuses_resident_shared_heap() -> crate::Result<()> {
+    use dupe::Dupe;
+    use pagable::storage::handle::PagableStorageHandle;
+    use pagable::storage::in_memory::InMemoryPagableStorage;
+
+    let heap = FrozenHeap::new();
+    let x = heap.alloc_simple(SimpleData {
+        flag: true,
+        count: 1,
+    });
+    let y = heap.alloc_simple(SimpleData {
+        flag: false,
+        count: 2,
+    });
+    let heap_ref = heap.into_ref_named(TestHeapName::heap_name("resident_shared"));
+    let x_ptr = x.ptr_value().ptr_value_untagged();
+
+    // SAFETY: both OwnedFrozenValues keep their shared heap alive.
+    let owned_x = unsafe { OwnedFrozenValue::new(heap_ref.dupe(), x) };
+    let owned_y = unsafe { OwnedFrozenValue::new(heap_ref, y) };
+
+    let backing = InMemoryPagableStorage::new();
+    let handle = PagableStorageHandle::new(backing.handle());
+    let key_x = ser_owned_frozen_value_into_storage(&backing, &owned_x)?;
+    drop(owned_x);
+
+    // `owned_y` is now the only application-owned reference keeping the
+    // original heap resident while X is paged back in.
+    let restored_x = deser_owned_frozen_value_from_storage(&backing, &handle, &key_x)?;
+    assert_eq!(
+        restored_x.owner(),
+        owned_y.owner(),
+        "page-in should reuse the original heap kept alive by Y",
+    );
+    assert_eq!(
+        restored_x.value().ptr_value().ptr_value_untagged(),
+        x_ptr,
+        "X should point to its original allocation in the resident heap",
+    );
+    let restored_data = restored_x
+        .value()
+        .downcast_ref::<SimpleData>()
+        .expect("restored X should be SimpleData");
+    assert_eq!(restored_data.count, 1);
+
+    Ok(())
 }
 
 /// Multi-heap, multi-`OwnedFrozenValue` partial-deser, with incremental
@@ -2901,7 +3076,7 @@ b.append(a)
 
     let ast = AstModule::parse("cross_thread.star", code.to_owned(), &Dialect::Extended).unwrap();
     let globals = GlobalsBuilder::new().build_named(GlobalFrozenHeapName {
-        name: "cross_thread",
+        name: CROSS_THREAD_GLOBALS_HEAP_NAME,
     });
     let frozen_module = Module::with_temp_heap(|module| {
         {
@@ -3133,8 +3308,9 @@ fn bench_pagable_ser_deser_by_value_type() -> crate::Result<()> {
         let code = lines.join("\n");
 
         let ast = AstModule::parse("bench_module.star", code, &Dialect::Extended)?;
-        let globals =
-            GlobalsBuilder::new().build_named(GlobalFrozenHeapName { name: "bench_eval" });
+        let globals = GlobalsBuilder::new().build_named(GlobalFrozenHeapName {
+            name: BENCH_EVAL_HEAP_NAME,
+        });
         let frozen_module = Module::with_temp_heap(|module| {
             {
                 let mut eval = Evaluator::new(&module);
@@ -3350,6 +3526,12 @@ fn test_concurrent_page_in_does_not_hash_sentinel_key() {
     let key_data = ser_one(&ofv_key);
     let map_data = ser_one(&ofv_map);
 
+    // Force page-in through deserialization. Otherwise resident-heap reuse
+    // returns the source allocation and `GateField::starlark_deserialize` never runs.
+    drop(ofv_key);
+    drop(ofv_map);
+    drop(heap_ref);
+
     // Install the gate so the key's deserialization blocks.
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -3377,7 +3559,9 @@ fn test_concurrent_page_in_does_not_hash_sentinel_key() {
     // Thread A: deserialize the key. It claims the key and blocks inside GateField.
     let h_a = deser_one(key_data, handle.clone(), storage.clone());
     // Wait until A is blocked inside the key's deser (key is now in-progress).
-    started_rx.recv().expect("key deser never started");
+    started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("key deser never started");
 
     // Thread B: deserialize the map, which must hash the (in-progress) key.
     let h_b = deser_one(map_data, handle.clone(), storage.clone());
@@ -3447,13 +3631,9 @@ fn page_out_in_module(
 /// Serialize a `FrozenModule`, returning the top-level data buffer.
 fn serialize_module_top_bytes(
     frozen_module: &crate::environment::FrozenModule,
+    session_ctx: &pagable::SessionContext,
 ) -> crate::Result<Vec<u8>> {
-    use pagable::storage::in_memory::InMemoryPagableStorage;
     use pagable::storage::support::SerializerForPaging;
-
-    let backing = InMemoryPagableStorage::new();
-    let storage = backing.handle();
-    let session_ctx = storage.session_context();
 
     let mut ser = SerializerForPaging::new(session_ctx);
     frozen_module
@@ -3516,7 +3696,7 @@ def many_locals():
 
     let ast = AstModule::parse("test_bcinstrs.star", code.to_owned(), &Dialect::Extended)?;
     let globals = GlobalsBuilder::standard().build_named(GlobalFrozenHeapName {
-        name: "test_bcinstrs",
+        name: TEST_BCINSTRS_HEAP_NAME,
     });
     let frozen_module = Module::with_temp_heap(|module| {
         {
@@ -3620,7 +3800,7 @@ def use_comprehension():
     // Shared globals so native-fn refs (`range`) get the same `HeapRefId` in
     // both compilations.
     let globals = GlobalsBuilder::standard().build_named(GlobalFrozenHeapName {
-        name: "test_bcinstrs_det_globals",
+        name: TEST_BCINSTRS_DET_GLOBALS_HEAP_NAME,
     });
 
     // Same heap name both times so self-references encode to the same `HeapRefId`.
@@ -3639,8 +3819,12 @@ def use_comprehension():
         })?)
     };
 
-    let bytes_a = serialize_module_top_bytes(&compile()?)?;
-    let bytes_b = serialize_module_top_bytes(&compile()?)?;
+    let backing = pagable::storage::in_memory::InMemoryPagableStorage::new();
+    let storage = backing.handle();
+    let session_ctx = storage.session_context();
+
+    let bytes_a = serialize_module_top_bytes(&compile()?, session_ctx)?;
+    let bytes_b = serialize_module_top_bytes(&compile()?, session_ctx)?;
 
     assert_eq!(
         bytes_a, bytes_b,

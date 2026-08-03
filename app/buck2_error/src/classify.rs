@@ -194,7 +194,6 @@ fn tag_metadata(tag: ErrorTag) -> TagMetadata {
         ErrorTag::IoWindowsNoSystemResources => rank!(environment),
         ErrorTag::RePermissionDenied => rank!(environment),
         ErrorTag::ReUserBadCerts => rank!(environment),
-        ErrorTag::ReResourceExhausted => rank!(environment),
         ErrorTag::EPerm => rank!(environment),
         ErrorTag::IoPermissionDenied => rank!(environment),
         ErrorTag::IoStorageFull => rank!(environment),
@@ -388,7 +387,6 @@ fn tag_metadata(tag: ErrorTag) -> TagMetadata {
         ErrorTag::DiceDuplicatedChange => rank!(tier0),
         ErrorTag::DiceChangedToInvalid => rank!(tier0),
         ErrorTag::DiceInjectedKeyGotInvalidation => rank!(tier0),
-        ErrorTag::DiceCancelled => rank!(tier0),
         ErrorTag::DiceUnexpectedCycleGuardType => rank!(tier0),
         ErrorTag::DiceDuplicateActivationData => rank!(tier0),
         // "Resource temporarily unavailable"
@@ -446,6 +444,7 @@ fn tag_metadata(tag: ErrorTag) -> TagMetadata {
         ErrorTag::InstallerInput => rank!(input).hidden(),
         ErrorTag::BuildDeadlineExpired => rank!(input),
         ErrorTag::EventLogIndexOutOfBounds => rank!(input),
+        ErrorTag::ReResourceExhausted => rank!(input),
         ErrorTag::ReUserQuota => rank!(input),
         // Test runner hit fatal errors during test execution
         ErrorTag::TestFatal => rank!(input),

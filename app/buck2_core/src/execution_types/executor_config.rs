@@ -127,12 +127,16 @@ pub enum ReGangLocality {
     Datacenter,
     /// Workers must be in the same network domain
     NetworkDomain,
+    /// Workers must be in the same rack
+    Rack,
 }
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(input)]
 enum ReGangLocalityErrors {
-    #[error("Invalid locality value `{0}`. Expected one of: region, datacenter, network_domain")]
+    #[error(
+        "Invalid locality value `{0}`. Expected one of: region, datacenter, network_domain, rack"
+    )]
     InvalidLocality(String),
 }
 
@@ -142,6 +146,7 @@ impl ReGangLocality {
             "region" => Ok(ReGangLocality::Region),
             "datacenter" => Ok(ReGangLocality::Datacenter),
             "network_domain" => Ok(ReGangLocality::NetworkDomain),
+            "rack" => Ok(ReGangLocality::Rack),
             _ => Err(ReGangLocalityErrors::InvalidLocality(s.to_owned()).into()),
         }
     }
@@ -159,6 +164,8 @@ pub struct ReGang {
     pub locality: Option<ReGangLocality>,
     /// Optional number of sub-groups for locality partitioning
     pub num_sub_groups: Option<i32>,
+    /// Optional resource_units each worker claims on its host
+    pub resource_units: Option<i32>,
 }
 
 #[derive(Debug, buck2_error::Error)]
@@ -180,6 +187,7 @@ impl ReGang {
         num_of_workers: i32,
         locality: Option<ReGangLocality>,
         num_sub_groups: Option<i32>,
+        resource_units: Option<i32>,
     ) -> buck2_error::Result<ReGang> {
         if num_of_workers <= 0 {
             return Err(ReGangErrors::InvalidNumOfWorkers(num_of_workers).into());
@@ -200,6 +208,7 @@ impl ReGang {
             num_of_workers,
             locality,
             num_sub_groups,
+            resource_units,
         })
     }
 }

@@ -23,6 +23,7 @@ use buck2_execute::materialize::utils::dynamic_priority_handle::DynamicPriorityH
 use buck2_execute::materialize::utils::priority_semaphore::Priority;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use parking_lot::Mutex;
 
 use super::*;
@@ -118,6 +119,7 @@ mod state_machine {
     use buck2_fs::paths::RelativePathBuf;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
     use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+    use buck2_hash::IntentionallyStdHashMap;
     use buck2_util::threads::ignore_stack_overflow_checks_for_future;
     use buck2_wrapper_common::invocation_id::TraceId;
     use futures::StreamExt;
@@ -427,8 +429,8 @@ mod state_machine {
     fn make_db(fs: &ProjectRoot) -> (MaterializerStateSqliteDb, Option<MaterializerState>) {
         let (db, state) = testing_materializer_state_sqlite_db(
             fs,
-            StdBuckHashMap::from([("version".to_owned(), "0".to_owned())]),
-            StdBuckHashMap::default(),
+            IntentionallyStdHashMap::from([("version".to_owned(), "0".to_owned())]),
+            IntentionallyStdHashMap::new(),
             None,
         )
         .unwrap();
@@ -495,6 +497,7 @@ mod state_machine {
     ) {
         let (mut processor, command_sender, command_receiver, daemon_dispatcher_events) =
             make_processor_for_io(io.dupe());
+        let stats = processor.stats.dupe();
 
         let handle = {
             let (sender, recv) = oneshot::channel();
@@ -535,7 +538,7 @@ mod state_machine {
                 materializer_state_info: buck2_data::MaterializerStateInfo {
                     num_entries_from_sqlite: 0,
                 },
-                stats: Arc::new(DeferredMaterializerStats::default()),
+                stats,
             },
             handle,
             daemon_dispatcher_events,
@@ -634,6 +637,168 @@ mod state_machine {
             ),
         );
         Ok(symlink_value)
+    }
+
+    #[tokio::test]
+    async fn test_final_output_accounting_includes_symlink_deps() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let (mut dm, _) = make_processor(Default::default());
+            let digest_config = dm.io.digest_config();
+            let target_path = make_path("foo/target");
+            let symlink_path = make_path("foo/link");
+            let target_from_symlink = RelativePathBuf::from_system_path(Path::new("target"))?;
+            let content = b"target contents";
+            let target_value = ArtifactValue::file(FileMetadata {
+                digest: TrackedFileDigest::from_content(content, digest_config.cas_digest_config()),
+                is_executable: false,
+            });
+            let symlink_value = make_artifact_value_with_symlink_dep(
+                &target_path,
+                &target_from_symlink,
+                digest_config,
+            )?;
+
+            dm.testing_declare_existing(&target_path, target_value.dupe());
+            dm.testing_declare_existing(&symlink_path, symlink_value);
+            assert_eq!(
+                *dm.stats.sizes.read(),
+                MaterializerSizeStats {
+                    final_output: 0,
+                    intermediate_only: content.len() as u64,
+                }
+            );
+            let persisted = dm
+                .sqlite_db
+                .as_mut()
+                .expect("test processor should have sqlite state")
+                .materializer_state_table()
+                .read_materializer_state(digest_config)?;
+            assert_eq!(persisted.len(), 2);
+            assert!(
+                persisted
+                    .iter()
+                    .all(|entry| entry.classification == ArtifactClassification::IntermediateOnly)
+            );
+
+            let (sender, receiver) = oneshot::channel();
+            dm.testing_process_one_command(MaterializerCommand::Ensure(
+                vec![symlink_path.clone()],
+                MaterializationPurpose::FinalOutput,
+                EventDispatcher::null(),
+                None,
+                sender,
+            ));
+            let _materializations = receiver.await?;
+
+            for path in [&target_path, &symlink_path] {
+                let data = dm
+                    .tree
+                    .prefix_get(&mut path.iter())
+                    .expect("declared artifact should be present");
+                assert_eq!(data.classification, ArtifactClassification::FinalOutput);
+            }
+            assert_eq!(
+                *dm.stats.sizes.read(),
+                MaterializerSizeStats {
+                    final_output: content.len() as u64,
+                    intermediate_only: 0,
+                }
+            );
+            let persisted = dm
+                .sqlite_db
+                .as_mut()
+                .expect("test processor should have sqlite state")
+                .materializer_state_table()
+                .read_materializer_state(digest_config)?;
+            assert!(
+                persisted
+                    .iter()
+                    .all(|entry| entry.classification == ArtifactClassification::FinalOutput)
+            );
+
+            dm.testing_declare_existing(&target_path, target_value);
+            let data = dm
+                .tree
+                .prefix_get(&mut target_path.iter())
+                .expect("redeclared artifact should be present");
+            assert_eq!(data.classification, ArtifactClassification::FinalOutput);
+            assert_eq!(
+                *dm.stats.sizes.read(),
+                MaterializerSizeStats {
+                    final_output: content.len() as u64,
+                    intermediate_only: 0,
+                }
+            );
+
+            let (sender, receiver) = oneshot::channel();
+            dm.testing_process_one_command(MaterializerCommand::InvalidateFilePaths(
+                vec![target_path, symlink_path],
+                sender,
+                EventDispatcher::null(),
+                None,
+            ));
+            receiver.await?.await?;
+            assert_eq!(*dm.stats.sizes.read(), MaterializerSizeStats::default());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_skipped_final_output_stays_intermediate_only() -> buck2_error::Result<()> {
+        ignore_stack_overflow_checks_for_future(async {
+            let io = Arc::new(StubIoHandler::new(temp_root()));
+            let digest_config = io.digest_config();
+            let path = make_path("foo/skipped");
+            let content = b"skipped contents";
+            let value = ArtifactValue::file(FileMetadata {
+                digest: TrackedFileDigest::from_content(content, digest_config.cas_digest_config()),
+                is_executable: false,
+            });
+            let (mut dm, _handle, _events) = make_materializer(io, None).await;
+            dm.materialize_final_artifacts = false;
+            dm.declare_existing(vec![DeclareArtifactPayload {
+                path: path.clone(),
+                artifact: value,
+                configuration_path: None,
+            }])
+            .await?;
+            assert!(dm.has_artifact_at(path.clone()).await?);
+
+            assert!(!dm.try_materialize_final_artifact(path.clone()).await?);
+            assert_eq!(
+                *dm.stats.sizes.read(),
+                MaterializerSizeStats {
+                    final_output: 0,
+                    intermediate_only: content.len() as u64,
+                }
+            );
+
+            let mut snapshot = buck2_data::Snapshot::default();
+            dm.add_snapshot_stats(&mut snapshot);
+            assert_eq!(snapshot.deferred_materializer_final_output_logical_bytes, 0);
+            assert_eq!(
+                snapshot.deferred_materializer_intermediate_only_logical_bytes,
+                content.len() as u64
+            );
+
+            dm.materialize_final_artifacts = true;
+            assert!(dm.try_materialize_final_artifact(path).await?);
+            let mut snapshot = buck2_data::Snapshot::default();
+            dm.add_snapshot_stats(&mut snapshot);
+            assert_eq!(
+                snapshot.deferred_materializer_final_output_logical_bytes,
+                content.len() as u64
+            );
+            assert_eq!(
+                snapshot.deferred_materializer_intermediate_only_logical_bytes,
+                0
+            );
+            dm.abort();
+            Ok(())
+        })
+        .await
     }
 
     #[tokio::test]

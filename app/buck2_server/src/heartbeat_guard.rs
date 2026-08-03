@@ -72,16 +72,17 @@ impl HeartbeatGuard {
         }
     }
 
-    pub(crate) async fn finalize(mut self) {
+    /// Stop the heartbeat and emit one last snapshot, returning it so callers can
+    /// reuse the command-end resource reading (e.g. to gate idle page-out).
+    pub(crate) async fn finalize(mut self) -> buck2_data::Snapshot {
         // Make sure we stop sending new snapshots
         let handle = self.handle.take().unwrap();
         handle.abort();
         drop(handle.await);
-        // Send one last snapshot, with the page-in breakdown so this command's
-        // page-in overhead is captured in the invocation record.
-        self.events.instant_event(Box::new(
-            self.collector.create_snapshot_with_page_in_metrics().await,
-        ));
+        // Send one last snapshot.
+        let snapshot = self.collector.create_snapshot().await;
+        self.events.instant_event(Box::new(snapshot.clone()));
+        snapshot
     }
 }
 

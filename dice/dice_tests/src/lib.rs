@@ -10,10 +10,12 @@
 
 #![cfg(test)]
 
+mod compute_ref;
 mod general;
 mod invalidation_tracking;
 mod legacy;
 mod linear_recompute;
 mod multiversion;
 mod opaque;
+mod paging;
 mod projection;

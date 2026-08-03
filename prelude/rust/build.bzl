@@ -171,6 +171,11 @@ def generate_rustdoc(
     plain_env, path_env = process_env(compile_ctx, toolchain_info.rustdoc_env | ctx.attrs.env)
     plain_env["RUSTDOC_BUCK_TARGET"] = cmd_args(str(ctx.label.raw_target()))
 
+    # The toolchain's `rustdoc_flags` may rely on unstable functionality, e.g.
+    # `--generate-link-to-definition`.
+    if toolchain_info.nightly_features and "RUSTC_BOOTSTRAP" not in plain_env:
+        plain_env["RUSTC_BOOTSTRAP"] = cmd_args("1")
+
     if toolchain_info.rust_target_path != None:
         path_env["RUST_TARGET_PATH"] = toolchain_info.rust_target_path[DefaultInfo].default_outputs[0]
 
@@ -214,6 +219,9 @@ def generate_rustdoc_coverage(
     default_roots: list[str],
 ) -> Artifact:
     toolchain_info = compile_ctx.toolchain_info
+
+    if not toolchain_info.nightly_features:
+        fail("Doc coverage uses the unstable `--show-coverage` flag and requires a toolchain with `nightly_features = True`")
 
     common_args = _compute_common_args(
         ctx = ctx,
@@ -279,6 +287,10 @@ def generate_rustdoc_test(
     default_roots: list[str],
 ) -> cmd_args:
     toolchain_info = compile_ctx.toolchain_info
+
+    if not toolchain_info.nightly_features:
+        fail("Doctests use the unstable `--test-runtool` flag and require a toolchain with `nightly_features = True`")
+
     internal_tools_info = compile_ctx.internal_tools_info
     doc_dep_ctx = DepCollectionContext(
         advanced_unstable_linking = compile_ctx.dep_ctx.advanced_unstable_linking,
@@ -393,7 +405,7 @@ def generate_rustdoc_test(
         plain_env.pop(k, None)
         path_env[k] = v
 
-    # `--runtool` is unstable.
+    # `--test-runtool` is unstable.
     plain_env["RUSTC_BOOTSTRAP"] = cmd_args("1")
     unstable_options = ["-Zunstable-options"]
 
@@ -468,6 +480,12 @@ def rust_compile(
     profile_mode: ProfileMode | None = None,
 ) -> RustcOutput:
     toolchain_info = compile_ctx.toolchain_info
+
+    if not toolchain_info.nightly_features:
+        if emit == Emit("expand"):
+            fail("Expansion uses the unstable `-Zunpretty` flag and requires a toolchain with `nightly_features = True`")
+        if profile_mode in (ProfileMode("llvm-time-trace"), ProfileMode("self-profile")):
+            fail("`{}` profiling uses unstable `-Z` flags and requires a toolchain with `nightly_features = True`".format(profile_mode.value))
 
     lints = _lint_flags(compile_ctx, infallible_diagnostics, emit == Emit("clippy"))
     use_cbp = getattr(ctx.attrs, "use_content_based_paths", False)
@@ -1259,7 +1277,12 @@ def _compute_common_args(
         ["--target={}".format(toolchain_info.rustc_target_triple)] if toolchain_info.rustc_target_triple else [],
         split_debuginfo_flags,
         compile_ctx.sysroot_args,
-        ["-Cpanic=abort", "-Zpanic-abort-tests=yes"] if toolchain_info.panic_runtime == PanicRuntime("abort") else [],
+        # `-Zpanic-abort-tests` makes the test harness work despite the abort
+        # runtime. Without nightly features it can't be passed; test targets
+        # will be rejected by rustc.
+        (["-Cpanic=abort"] + (["-Zpanic-abort-tests=yes"] if toolchain_info.nightly_features else []))
+        if toolchain_info.panic_runtime == PanicRuntime("abort")
+        else [],
         ["-Zsanitizer={}".format(toolchain_info.sanitizer.value)] if toolchain_info.sanitizer else [],
         ["-Cprofile-generate={}".format(toolchain_info.pgo_generate_dir), "-Zno-profiler-runtime"]
         if toolchain_info.pgo_generate_dir and toolchain_info.explicit_sysroot_deps and toolchain_info.explicit_sysroot_deps.core
@@ -1440,17 +1463,11 @@ def _rustc_emit(
         emit_output = ctx.actions.declare_output(filename, has_content_based_path = emit_cbp)
 
     if emit == Emit("expand"):
-        emit_env["RUSTC_BOOTSTRAP"] = "1"
         emit_args.add(
             "-Zunpretty=expanded",
             cmd_args(emit_output.as_output(), format = "-o{}"),
         )
     else:
-        # Even though the unstable flag only appears on one of the branches, we need
-        # an identical environment between the `-Zno-codegen` and non-`-Zno-codegen`
-        # command or else there are "found possibly newer version of crate" errors.
-        emit_env["RUSTC_BOOTSTRAP"] = "1"
-
         if emit == Emit("metadata-full"):
             if crate_type not in (CrateType("rlib"), CrateType("dylib")):
                 # Nothing ever needs the metadata from these crate types, so we can
@@ -1466,6 +1483,8 @@ def _rustc_emit(
                 # IMPORTANT: this flag is the only way that the Emit("metadata") and
                 # Emit("link") operations are allowed to diverge without causing them to
                 # get different crate hashes.
+                if not compile_ctx.toolchain_info.nightly_features:
+                    fail("Pipelined builds use the unstable `-Zno-codegen` flag and require a toolchain with `nightly_features = True`")
                 emit_args.add("-Zno-codegen")
                 effective_emit = "link"
         elif emit == Emit("metadata-fast") or emit == Emit("clippy"):
@@ -1550,6 +1569,16 @@ def _rustc_invoke(
     plain_env.update(more_plain_env)
     path_env.update(more_path_env)
 
+    # `nightly_features` grants the rules use of unstable functionality. Both
+    # internally and in OSS the compiler is typically a stable-channel build,
+    # where that functionality must be unlocked by setting `RUSTC_BOOTSTRAP=1`;
+    # on an actual nightly compiler the variable is harmless. This must be
+    # uniform across all invocations for a crate: rustc includes the variable
+    # in its crate hashes, so differences between e.g. the metadata and link
+    # commands cause "found possibly newer version of crate" errors.
+    if toolchain_info.nightly_features and "RUSTC_BOOTSTRAP" not in plain_env:
+        plain_env["RUSTC_BOOTSTRAP"] = "1"
+
     # Save diagnostic outputs
     diag = "clippy" if is_clippy else "diag"
     use_cbp = getattr(ctx.attrs, "use_content_based_paths", False)
@@ -1614,6 +1643,19 @@ def _rustc_invoke(
             identifier += " "
         identifier += "[incr]"
 
+    # None defers the choice to the `buck2.default_allow_cache_upload` config; an
+    # explicit False overrides it. Actions without a preference pass None.
+    if allow_cache_upload or deferred_link_cmd != None:
+        # Opted in, or a deferred link. In the latter rustc compiles objects
+        # without linking, and we always cache those.
+        action_allow_cache_upload = True
+    elif is_clippy:
+        # Clippy never uploads.
+        action_allow_cache_upload = False
+    else:
+        # Libraries (check, metadata, rlib) have no preference.
+        action_allow_cache_upload = None
+
     ctx.actions.run(
         compile_cmd,
         local_only = local_only,
@@ -1622,8 +1664,7 @@ def _rustc_invoke(
         category = category,
         identifier = identifier,
         no_outputs_cleanup = incremental_enabled,
-        # We want to unconditionally cache object file compilations when rustc is not linking
-        allow_cache_upload = allow_cache_upload or deferred_link_cmd != None,
+        allow_cache_upload = action_allow_cache_upload,
         error_handler = toolchain_info.rust_error_handler,
     )
 
@@ -1634,7 +1675,8 @@ def _rustc_invoke(
             prefer_local = prefer_local,
             category = "deferred_link",
             identifier = identifier,
-            allow_cache_upload = allow_cache_upload,
+            # Defer to `buck2.default_allow_cache_upload` unless explicitly opted in.
+            allow_cache_upload = allow_cache_upload or None,
         )
 
     return Invoke(

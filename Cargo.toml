@@ -152,6 +152,7 @@ members = [
   "remote_execution/oss/re_grpc_proto",
   "shed/lock_free_hashtable",
   "shed/lock_free_vec",
+  "shed/mini_vec",
   "shed/provider",
   "shed/setsketch",
   "shed/static_interner",
@@ -164,6 +165,7 @@ members = [
   "starlark-rust/starlark_map",
   "starlark-rust/starlark_syntax",
   "superconsole",
+  "tools/starlark_fmt",
 ]
 resolver = "2"
 
@@ -177,7 +179,8 @@ repository = "https://github.com/facebook/buck2"
 allocative = { path = "allocative/allocative", features = ["anyhow", "bumpalo", "chrono", "compact_str", "dashmap", "either", "futures", "hashbrown", "indexmap", "num-bigint", "once_cell", "parking_lot", "prost-types", "serde_json", "slab", "smallvec", "sorted_vector_map", "tokio", "triomphe"] }
 anyhow = "1.0.103"
 anymap3 = "1.1.0"
-arc-swap = { version = "1.9.0", features = ["weak"] }
+arc-swap = { version = "1.9.2", features = ["weak"] }
+argfile = "0.2.1"
 assert_matches = "1.5"
 async-compression = { version = "0.4.42", features = ["brotli", "bzip2", "deflate", "futures-io", "gzip", "tokio", "zlib", "zstd", "zstdmt"] }
 async-condvar-fair = { version = "1.0.1", features = ["parking_lot_0_12", "tokio"] }
@@ -188,6 +191,7 @@ async-trait = "0.1.86"
 backtrace = "0.3"
 base64 = { version = "0.22.1", features = ["alloc"] }
 bincode = { version = "2", features = ["serde"] }
+bit-set = "0.9"
 blake3 = { version = "=1.8.2", features = ["mmap", "rayon", "traits-preview"] }
 buck2_action_impl = { path = "app/buck2_action_impl" }
 buck2_action_metadata_proto = { path = "app/buck2_action_metadata_proto" }
@@ -279,10 +283,10 @@ buck2_validation = { path = "app/buck2_validation" }
 buck2_worker_proto = { path = "app/buck2_worker_proto" }
 buck2_wrapper_common = { path = "app/buck2_wrapper_common" }
 bumpalo = { version = "3.20.3", features = ["allocator_api", "collections"] }
-bytes = { version = "1.12.0", features = ["serde"] }
-bytesize = "2.4.0"
+bytes = { version = "1.12.1", features = ["serde"] }
+bytesize = "2.4.2"
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
-clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
 cmp_any = { path = "gazebo/cmp_any" }
 common-path = "1.0.0"
@@ -292,10 +296,10 @@ const_format = "0.2.36"
 constant_time_eq = "0.2.6"
 convert_case = "0.11"
 crossbeam = "0.8"
-crossbeam-channel = "0.5.15"
+crossbeam-channel = "0.5.16"
 crossterm = { version = "0.29", features = ["event-stream", "serde"] }
 csv = "1.4.0"
-ctor = "1.0.7"
+ctor = "1.0.8"
 dashmap = { version = "6.2.1", features = ["rayon", "serde"] }
 debugserver-types = "0.5.0"
 derivative = "2.2"
@@ -326,17 +330,17 @@ fxhash = "0.2.1"
 games = { path = "games" }
 gazebo = { path = "gazebo/gazebo", features = ["str_pattern_extensions"] }
 glob = "0.3.2"
-globset = { version = "0.4.13", features = ["serde1"] }
+globset = { version = "0.4.19", features = ["serde1"] }
 hashbrown = "0.17.1"
 hex = { version = "0.4.3", features = ["alloc"] }
 host_sharing = { path = "host_sharing" }
 hostname = "0.4.2"
 http = "1.4.2"
-http-body = "1.0.1"
-http-body-util = "0.1.0"
+http-body = "1.1.0"
+http-body-util = "0.1.4"
 httparse = "1.7.1"
 httptest = "0.16.4"
-humantime = "2.1"
+humantime = "2.4.0"
 hyper = { version = "1.10.1", features = ["client", "http1", "http2"] }
 hyper-http-proxy = "1.1.1"
 hyper-rustls = { version = "0.27.9", features = ["http2"] }
@@ -362,15 +366,16 @@ lru = { version = "0.16.4", default-features = false }
 lsp-server = "0.7.9"
 lsp-types = "0.97"
 maplit = "1.0"
-memchr = "2.8.2"
+memchr = "2.8.3"
 memmap2 = "0.9.11"
 mimalloc = { version = "0.1.52", default-features = false }
+mini_vec = { path = "shed/mini_vec" }
 multimap = "0.8.3"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 nom = "8"
 nom-language = "0.1"
 notify = "8.2.0"
-num-bigint = { version = "0.4.6", features = ["rand", "serde"] }
+num-bigint = { version = "0.4.8", features = ["rand", "serde"] }
 num_enum = "0.7.6"
 object = { version = "0.36.7", features = ["read", "write"] }
 os_str_bytes = { version = "6.6.1", features = ["conversions"] }
@@ -381,7 +386,7 @@ paste = "1.0.14"
 pathdiff = "0.2"
 perf-event = "0.4"
 pin-project = "1.1.13"
-plist = "1.9.0"
+plist = "1.10.0"
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 prost = { version = "0.14.4", default-features = false }
@@ -389,34 +394,43 @@ prost-types = { version = "0.14.4", default-features = false }
 protoc-bin-vendored = "3.0.0"
 psutil = "3.3.0"
 quick-xml = { version = "0.37", features = ["overlapped-lists", "serialize"] }
+quickcheck = "1.1"
+quickcheck_macros = "1.2.0"
 quote = "1.0.46"
-rand = "0.10.1"
+rand = "0.10.2"
 rand_chacha = "0.10"
 rand_distr = "0.6"
 rand_xoshiro = "0.8.1"
+rayon = "1.11.0"
 re_grpc_proto = { path = "remote_execution/oss/re_grpc_proto" }
 ref-cast = "1.0.18"
-regex = "1.12.4"
+regex = "1.13.1"
 remote_execution = { path = "remote_execution/oss/re_grpc" }
-rusqlite = { version = "0.37.0", features = ["backup", "blob", "bundled", "column_decltype", "functions", "limits", "modern_sqlite", "serde_json"] }
-rustc-hash = "2.1.2"
+ruff_formatter = "0.0.6"
+ruff_python_ast = "0.0.6"
+ruff_python_formatter = "0.0.6"
+ruff_python_parser = "0.0.6"
+ruff_python_trivia = "0.0.6"
+ruff_source_file = "0.0.6"
+ruff_text_size = "0.0.6"
+rusqlite = { version = "0.37.0", features = ["backup", "blob", "bundled", "column_decltype", "functions", "limits", "modern_sqlite", "serde_json", "vtab"] }
+rustc-hash = "2.1.3"
 rustls = { version = "0.23.37", features = ["ring"] }
 rustls-native-certs = "0.8.3"
-rustls-pki-types = { version = "1.14.1", features = ["alloc", "std"] }
+rustls-pki-types = { version = "1.15.0", features = ["alloc", "std"] }
 scopeguard = "1.2.0"
 sequence_trie = { version = "0.3.6", features = ["serde"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_path_to_error = "0.1.20"
 setsketch = { path = "shed/setsketch" }
-sha1 = "0.10.5"
+sha1 = "0.10.7"
 sha2 = "0.10.6"
 shlex = "1.3"
 similar = { version = "2.2.0", features = ["bytes", "inline"] }
 siphasher = "1.0.3"
-slab = "0.4.12"
 slog = { version = "2.8.2", features = ["max_level_trace", "nested-values"] }
-smallvec = { version = "1.15.2", features = ["impl_bincode", "serde", "specialization", "union", "write"] }
+smallvec = { version = "1.15.2", features = ["const_generics", "impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = "0.2.1"
 starlark = { path = "starlark-rust/starlark", features = ["pagable"] }
 starlark_lsp = { path = "starlark-rust/starlark_lsp" }
@@ -428,13 +442,14 @@ strong_hash = { path = "gazebo/strong_hash", features = ["num-bigint", "triomphe
 strsim = "0.11.1"
 strum = { version = "0.28.0", features = ["derive"] }
 superconsole = { path = "superconsole" }
-syn = { version = "2.0.118", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn = { version = "2.0.119", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 sync_wrapper = "1.0.2"
 sys-info = "0.9.1"
 sysinfo = "0.38.4"
 take_mut = "0.2"
 tar = "0.4.46"
 tempfile = "3.27.0"
+termcolor = "1.0"
 termimad = "0.34.1"
 termios = "0.3"
 termwiz = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331", features = ["use_serde", "widgets"], default-features = false }
@@ -443,13 +458,13 @@ textwrap = { version = "0.16.0", features = ["terminal_size"] }
 thiserror = "2.0.18"
 threadpool = "1.8.1"
 three_billion_instructions = { path = "shed/three_billion_instructions" }
-tikv-jemallocator = "0.6.1"
-tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
+tikv-jemallocator = { version = "0.6.1", features = ["stats", "unprefixed_malloc_on_supported_platforms"] }
+tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tokio-retry = "0.3.2"
 tokio-rustls = { version = "0.26.4", features = ["logging", "ring", "tls12"], default-features = false }
 tokio-stream = { version = "0.1.18", features = ["fs", "io-util", "net", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["full"] }
-toml = { version = "1.1.2", features = ["preserve_order"] }
+toml = { version = "1.1.3", features = ["preserve_order"] }
 tonic = { version = "0.14.6", features = ["codegen", "gzip", "tls-native-roots", "tls-ring", "tls-webpki-roots", "transport"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
@@ -459,10 +474,9 @@ tower-lsp-server = "0.22.1"
 tower-service = "0.3.3"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "json", "local-time", "parking_lot", "registry"] }
-triomphe = { version = "0.1.11", features = ["arc-swap"] }
+triomphe = { version = "0.1.16", features = ["arc-swap"] }
 twox-hash = "1.6.1"
-typed-arena = "2"
-uuid = { version = "1.23.4", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
+uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 walkdir = "2.3"
 watchman_client = "0.9.0"
 whoami = "1.5"
@@ -473,4 +487,4 @@ xattr = "1.6.1"
 zstd = { version = "0.13.3", features = ["experimental", "zstdmt"] }
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ["cfg(fbcode_build)", "cfg(buck_build)", "cfg(client_only)", "cfg(tokio_unstable)"]}
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(fbcode_build)", "cfg(buck_build)", "cfg(client_only)", "cfg(tokio_unstable)", "cfg(mini_vec_no_ptr_packing)"]}

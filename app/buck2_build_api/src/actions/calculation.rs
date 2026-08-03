@@ -54,14 +54,12 @@ use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use futures::future::{self};
 use pagable::Pagable;
 use pagable::pagable_typetag;
 use ref_cast::RefCast;
 use smallvec::SmallVec;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
-use tracing::debug;
 
 use crate::actions::RegisteredAction;
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
@@ -91,9 +89,6 @@ async fn build_action_impl(
     cancellation: &CancellationContext,
     key: &ActionKey,
 ) -> buck2_error::Result<ActionOutputs> {
-    // Compute is only called if we have cache miss
-    debug!("compute {}", key);
-
     let action = ActionCalculation::get_action(ctx, key).await?;
 
     if action.key() != key {
@@ -109,6 +104,8 @@ async fn build_action_impl(
 
     build_action_no_redirect(ctx, cancellation, action).await
 }
+
+mini_vec::size_assert::words_of_async_fn_future!(build_action_impl, (_, _, _), ~43);
 
 async fn build_action_no_redirect(
     ctx: &mut DiceComputations<'_>,
@@ -130,7 +127,9 @@ async fn build_action_no_redirect(
                 && (pref.prefers_local() || executor.is_full_hybrid_enabled())
         }) {
         let artifact_fs = ctx.get_artifact_fs().await?;
-        let eager_paths = collect_eager_paths(ctx, &inputs, &artifact_fs).await?;
+        let eager_paths = collect_eager_paths(ctx, &inputs, &artifact_fs)
+            .boxed()
+            .await?;
 
         if eager_paths.is_empty() {
             None
@@ -149,22 +148,16 @@ async fn build_action_no_redirect(
     let ensured_inputs = if inputs.is_empty() {
         BuckIndexMap::default()
     } else {
-        let ready_inputs: Vec<_> = tokio::task::unconstrained(KeepGoing::try_compute_join_all(
-            ctx,
-            inputs.iter(),
-            |ctx, v| {
-                async move {
-                    let resolved = v.resolved_artifact(ctx).await?;
-                    buck2_error::Ok(
-                        ensure_artifact_group_staged(ctx, resolved.clone())
-                            .await?
-                            .into_group_values(&resolved)?,
-                    )
-                }
-                .boxed()
-            },
-        ))
-        .await?;
+        let ready_inputs: Vec<_> =
+            KeepGoing::try_compute_join_all(ctx, inputs.iter(), async |ctx, v| {
+                let resolved = v.resolved_artifact(ctx).await?;
+                buck2_error::Ok(
+                    ensure_artifact_group_staged(ctx, resolved)
+                        .await?
+                        .into_group_values(resolved)?,
+                )
+            })
+            .await?;
 
         let mut results = BuckIndexMap::with_capacity(inputs.len());
         for (artifact, ready) in zip(inputs.iter(), ready_inputs) {
@@ -173,6 +166,26 @@ async fn build_action_no_redirect(
         results
     };
 
+    let now = TimeSpan::start_now();
+
+    let target_rule_type_name = match action.key().owner() {
+        BaseDeferredKey::TargetLabel(target_label) => {
+            Some(get_target_rule_type_name(ctx, target_label).await?)
+        }
+        _ => None,
+    };
+
+    let fut = build_action_inner(
+        ctx,
+        cancellation,
+        &executor,
+        waiting_data,
+        ensured_inputs,
+        &action,
+        target_rule_type_name,
+    );
+
+    // Don't hold this across an await point
     let start_event = buck2_data::ActionExecutionStart {
         key: Some(action.key().as_proto()),
         kind: action.kind().into(),
@@ -182,32 +195,10 @@ async fn build_action_no_redirect(
         }),
     };
 
-    let now = TimeSpan::start_now();
-    let action = &action;
-
-    let target = match action.key().owner() {
-        BaseDeferredKey::TargetLabel(target_label) => Some(target_label.dupe()),
-        _ => None,
-    };
-
-    let target_rule_type_name = match target {
-        Some(label) => Some(get_target_rule_type_name(ctx, &label).await?),
-        None => None,
-    };
-
-    let fut = build_action_inner(
-        ctx,
-        cancellation,
-        &executor,
-        waiting_data,
-        ensured_inputs,
-        action,
-        target_rule_type_name,
-    );
-
-    // boxed() the future so that we don't need to allocate space for it while waiting on input dependencies.
-    let (action_execution_data, spans) =
-        async_record_root_spans(span_async(start_event, fut.boxed())).await;
+    let (action_execution_data, spans) = async_record_root_spans(span_async(start_event, fut))
+        // boxed() the future so that we don't need to allocate space for it while waiting on input dependencies.
+        .boxed()
+        .await;
 
     let execution_metrics = ActionExecutionMetrics {
         key: action.key().dupe(),
@@ -316,7 +307,7 @@ async fn build_action_inner(
 
     let allow_omit_details = execute_result.is_ok();
 
-    let commands = future::join_all(
+    let commands = buck2_util::future::join_all(
         command_reports
             .iter()
             .map(|r| command_execution_report_to_proto(r, allow_omit_details)),
@@ -767,20 +758,17 @@ impl ActionCalculation {
         }
     }
 
-    pub fn build_action<'a>(
-        ctx: &'a mut DiceComputations<'_>,
+    pub fn build_action<'a, 'd>(
+        ctx: &'a mut DiceComputations<'d>,
         action_key: &ActionKey,
-    ) -> impl Future<Output = buck2_error::Result<ActionOutputs>> + use<'a> {
-        // build_action is called for every action key. We don't use `async fn` to ensure that it has minimal cost.
-        // We don't currently consume this in buck_e2e but it's good to log for debugging purposes.
-        debug!("build_action {}", action_key);
+    ) -> impl Future<Output = buck2_error::Result<ActionOutputs>> + use<'a, 'd> {
         ctx.compute(BuildKey::ref_cast(action_key)).map(|v| v?)
     }
 
-    pub fn build_artifact<'a>(
-        ctx: &'a mut DiceComputations<'_>,
+    pub fn build_artifact<'a, 'd>(
+        ctx: &'a mut DiceComputations<'d>,
         artifact: &BuildArtifact,
-    ) -> impl Future<Output = buck2_error::Result<ActionOutputs>> + use<'a> {
+    ) -> impl Future<Output = buck2_error::Result<ActionOutputs>> + use<'a, 'd> {
         Self::build_action(ctx, artifact.key())
     }
 }

@@ -11,7 +11,6 @@
 package com.facebook.buck.jvm.kotlin;
 
 import static com.facebook.buck.jvm.kotlin.ClasspathUtils.getClasspathSnapshots;
-import static com.facebook.buck.jvm.kotlin.KaptStepsBuilder.isKaptSupportedForCurrentKotlinLanguageVersion;
 import static com.facebook.buck.jvm.kotlin.KosabiStubgenStepsBuilder.prepareKosabiStubgenIfNeeded;
 import static com.facebook.buck.jvm.kotlin.KspStepsBuilder.prepareKspProcessorsIfNeeded;
 
@@ -219,35 +218,34 @@ public class DaemonKotlincToJarStepFactory extends BaseCompileToJarStepFactory<K
           kotlinCDAnalytics,
           extraParams.getLanguageVersion());
 
-      KspStepsBuilder.KSPInvocationStatus kspInvocationStatus =
-          prepareKspProcessorsIfNeeded(
-              Optional.ofNullable(actionMetadata),
-              extraParams,
-              invokingRule,
-              buildCellRootPath,
-              steps,
-              postKotlinCompilationSteps,
-              buildTargetValueExtraParams,
-              outputDirectory,
-              annotationGenFolder,
-              javacSourceBuilder,
-              reportsOutput,
-              parameters.getShouldTrackClassUsage(),
-              allClasspaths,
-              kotlinPluginGeneratedFullPath,
-              buildTargetValueExtraParams.getCellRelativeBasePath(),
-              annotationProcessorParams,
-              sourceWithStubsAndKaptOutputBuilder.build(),
-              pathToSrcsList,
-              kotlinHomeLibraries,
-              kotlinc,
-              compilerOutputPaths,
-              buckOut,
-              kosabiPluginOptions.getKosabiPlugins(),
-              sourceWithStubsAndKaptAndKspOutputBuilder,
-              compilationClasspathBuilder.build(),
-              moduleName,
-              kotlinCDAnalytics);
+      prepareKspProcessorsIfNeeded(
+          Optional.ofNullable(actionMetadata),
+          extraParams,
+          invokingRule,
+          buildCellRootPath,
+          steps,
+          postKotlinCompilationSteps,
+          buildTargetValueExtraParams,
+          outputDirectory,
+          annotationGenFolder,
+          javacSourceBuilder,
+          reportsOutput,
+          parameters.getShouldTrackClassUsage(),
+          allClasspaths,
+          kotlinPluginGeneratedFullPath,
+          buildTargetValueExtraParams.getCellRelativeBasePath(),
+          annotationProcessorParams,
+          sourceWithStubsAndKaptOutputBuilder.build(),
+          pathToSrcsList,
+          kotlinHomeLibraries,
+          kotlinc,
+          compilerOutputPaths,
+          buckOut,
+          kosabiPluginOptions.getKosabiPlugins(),
+          sourceWithStubsAndKaptAndKspOutputBuilder,
+          compilationClasspathBuilder.build(),
+          moduleName,
+          kotlinCDAnalytics);
 
       // Reduced SO-ABI classpath for the applicability plugin (rfsoa +
       // source_only_abi_deps only). Distinct from compilationClasspath which
@@ -272,7 +270,6 @@ public class DaemonKotlincToJarStepFactory extends BaseCompileToJarStepFactory<K
           reportsOutput,
           kotlinc,
           kosabiPluginOptions,
-          kspInvocationStatus,
           compilationClasspathBuilder.build(),
           applicabilityClasspath,
           postKotlinCompilationFailureSteps,
@@ -283,7 +280,6 @@ public class DaemonKotlincToJarStepFactory extends BaseCompileToJarStepFactory<K
 
     ResolvedJavacOptions resolvedJavacOptions = extraParams.getResolvedJavacOptions();
     if (hasKotlinSources
-        && isKaptSupportedForCurrentKotlinLanguageVersion(extraParams.getLanguageVersion())
         && extraParams.getAnnotationProcessingTool() == AnnotationProcessingTool.KAPT) {
       // Most of the time, KotlinC have ran annotation processing,
       // so only run "java on mix" processors (very uncommon) on Javac

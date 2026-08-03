@@ -21,11 +21,12 @@ use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
-use buck2_hash::StdBuckHashMap;
+use buck2_hash::IntentionallyStdHashMap;
 use chrono::DateTime;
 use chrono::Utc;
 use dupe::Dupe;
 
+use crate::materializers::deferred::artifact_tree::ArtifactClassification;
 use crate::materializers::deferred::artifact_tree::ArtifactMetadata;
 use crate::sqlite::tables::materializer_state_table::MaterializerStateSqliteTable;
 
@@ -34,13 +35,14 @@ use crate::sqlite::tables::materializer_state_table::MaterializerStateSqliteTabl
 /// materializer state sqlite db schema! If you forget to bump this version,
 /// then you can fix forward by bumping the `buck2.sqlite_materializer_state_version`
 /// buckconfig in the project root's .buckconfig.
-pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 8;
+pub const MATERIALIZER_DB_SCHEMA_VERSION: u64 = 9;
 
 #[derive(Debug)]
 pub struct MaterializerStateEntry {
     pub path: ProjectRelativePathBuf,
     pub metadata: ArtifactMetadata,
     pub last_access_time: DateTime<Utc>,
+    pub classification: ArtifactClassification,
 }
 
 pub type MaterializerState = Vec<MaterializerStateEntry>;
@@ -93,8 +95,8 @@ impl MaterializerStateSqliteDb {
     /// create a new one.
     pub async fn initialize(
         materializer_state_dir: AbsNormPathBuf,
-        versions: StdBuckHashMap<String, String>,
-        current_instance_metadata: StdBuckHashMap<String, String>,
+        versions: IntentionallyStdHashMap<String, String>,
+        current_instance_metadata: IntentionallyStdHashMap<String, String>,
         // Using `BlockingExecutor` out of convenience. This function should be called during startup
         // when there's not a lot of I/O so it shouldn't matter.
         io_executor: Arc<dyn BlockingExecutor>,
@@ -117,8 +119,8 @@ impl MaterializerStateSqliteDb {
     /// Internal implementation that handles digest config
     fn initialize_materializer_sqlite_db(
         materializer_state_dir: AbsNormPathBuf,
-        versions: StdBuckHashMap<String, String>,
-        current_instance_metadata: StdBuckHashMap<String, String>,
+        versions: IntentionallyStdHashMap<String, String>,
+        current_instance_metadata: IntentionallyStdHashMap<String, String>,
         digest_config: DigestConfig,
         reject_identity: Option<&SqliteIdentity>,
     ) -> buck2_error::Result<(Self, buck2_error::Result<MaterializerState>)> {
@@ -166,8 +168,8 @@ impl MaterializerStateSqliteDb {
 #[allow(unused)] // Used by test modules
 pub(crate) fn testing_materializer_state_sqlite_db(
     fs: &ProjectRoot,
-    versions: StdBuckHashMap<String, String>,
-    metadata: StdBuckHashMap<String, String>,
+    versions: IntentionallyStdHashMap<String, String>,
+    metadata: IntentionallyStdHashMap<String, String>,
     reject_identity: Option<&SqliteIdentity>,
 ) -> buck2_error::Result<(
     MaterializerStateSqliteDb,
@@ -200,6 +202,7 @@ mod tests {
     use buck2_execute::directory::ActionDirectoryMember;
     use buck2_execute::directory::new_symlink;
     use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+    use buck2_hash::StdBuckHashMap;
     use chrono::TimeZone;
     use itertools::Itertools;
     use parking_lot::Mutex;
@@ -304,21 +307,25 @@ mod tests {
                 path: ProjectRelativePath::unchecked_new("a").to_owned(),
                 metadata: DirectoryEntry::Dir(shared_directory),
                 last_access_time: now_seconds(),
+                classification: ArtifactClassification::FinalOutput,
             },
             MaterializerStateEntry {
                 path: ProjectRelativePath::unchecked_new("b/c").to_owned(),
                 metadata: DirectoryEntry::Leaf(file),
                 last_access_time: now_seconds(),
+                classification: ArtifactClassification::IntermediateOnly,
             },
             MaterializerStateEntry {
                 path: ProjectRelativePath::unchecked_new("d").to_owned(),
                 metadata: DirectoryEntry::Leaf(symlink),
                 last_access_time: now_seconds(),
+                classification: ArtifactClassification::FinalOutput,
             },
             MaterializerStateEntry {
                 path: ProjectRelativePath::unchecked_new("e").to_owned(),
                 metadata: DirectoryEntry::Leaf(external_symlink),
                 last_access_time: now_seconds(),
+                classification: ArtifactClassification::IntermediateOnly,
             },
         ];
         let mut artifacts: StdBuckHashMap<_, _> =
@@ -326,7 +333,12 @@ mod tests {
 
         for (path, entry) in artifacts.iter() {
             table
-                .insert(path, &entry.metadata, entry.last_access_time)
+                .insert(
+                    path,
+                    &entry.metadata,
+                    entry.last_access_time,
+                    entry.classification,
+                )
                 .unwrap();
         }
 
@@ -362,13 +374,14 @@ mod tests {
         fn eq(&self, other: &Self) -> bool {
             self.path == other.path
                 && self.last_access_time == other.last_access_time
+                && self.classification == other.classification
                 && artifact_metadata_eq(&self.metadata, &other.metadata)
         }
     }
 
     #[test]
     fn test_initialize_sqlite_db() -> buck2_error::Result<()> {
-        fn testing_metadatas() -> Vec<StdBuckHashMap<String, String>> {
+        fn testing_metadatas() -> Vec<IntentionallyStdHashMap<String, String>> {
             let metadata = buck2_events::metadata::collect(&DaemonId::new());
             let mut metadatas = vec![metadata; 5];
             for (i, metadata) in metadatas.iter_mut().enumerate() {
@@ -378,8 +391,8 @@ mod tests {
         }
 
         fn assert_metadata_matches(
-            mut have: StdBuckHashMap<String, String>,
-            want: &StdBuckHashMap<String, String>,
+            mut have: IntentionallyStdHashMap<String, String>,
+            want: &IntentionallyStdHashMap<String, String>,
         ) {
             // Remove the key we inject (and check it's there).
             have.remove("timestamp_on_initialization").unwrap();
@@ -398,8 +411,8 @@ mod tests {
         let timestamp = now_seconds();
         let metadatas = testing_metadatas();
 
-        let v0 = StdBuckHashMap::from([("version".to_owned(), "0".to_owned())]);
-        let v1 = StdBuckHashMap::from([("version".to_owned(), "1".to_owned())]);
+        let v0 = IntentionallyStdHashMap::from([("version".to_owned(), "0".to_owned())]);
+        let v1 = IntentionallyStdHashMap::from([("version".to_owned(), "1".to_owned())]);
 
         {
             let (mut db, loaded_state) = testing_materializer_state_sqlite_db(
@@ -416,7 +429,12 @@ mod tests {
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[0]);
 
             db.materializer_state_table()
-                .insert(&path, &artifact_metadata, timestamp)
+                .insert(
+                    &path,
+                    &artifact_metadata,
+                    timestamp,
+                    ArtifactClassification::FinalOutput,
+                )
                 .unwrap();
         }
 
@@ -427,7 +445,7 @@ mod tests {
             assert_matches!(
                 loaded_state,
                 Ok(v) => {
-                    assert_eq!(v, vec![MaterializerStateEntry {path: path.clone(), metadata: artifact_metadata.clone(), last_access_time: timestamp}]);
+                    assert_eq!(v, vec![MaterializerStateEntry {path: path.clone(), metadata: artifact_metadata.clone(), last_access_time: timestamp, classification: ArtifactClassification::FinalOutput}]);
                 }
             );
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[0]);
@@ -448,7 +466,12 @@ mod tests {
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[2]);
 
             db.materializer_state_table()
-                .insert(&path, &artifact_metadata, timestamp)
+                .insert(
+                    &path,
+                    &artifact_metadata,
+                    timestamp,
+                    ArtifactClassification::IntermediateOnly,
+                )
                 .unwrap();
         }
 
@@ -463,7 +486,7 @@ mod tests {
             assert_matches!(
                 loaded_state,
                 Ok(v) => {
-                    assert_eq!(v, vec![MaterializerStateEntry { path, metadata: artifact_metadata, last_access_time: timestamp }]);
+                    assert_eq!(v, vec![MaterializerStateEntry { path, metadata: artifact_metadata, last_access_time: timestamp, classification: ArtifactClassification::IntermediateOnly }]);
                 }
             );
             assert_metadata_matches(db.tables.created_by_table.read_all()?, &metadatas[2]);

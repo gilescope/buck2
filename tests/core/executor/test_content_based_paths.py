@@ -121,6 +121,11 @@ async def test_run_remote_with_content_based_path(buck: Buck) -> None:
         "--remote-only",
     )
     what_ran1 = await read_what_ran(buck)
+    # Flush the local dep file cache so the second (cross-configuration) build still goes through the
+    # RE path and shows up in what-ran. Otherwise it would be served by the cross-configuration local
+    # action cache (this action is dedupe-eligible), and what-ran would be empty. The cross-config
+    # local cache hit itself is covered by test_dep_files.py::test_dep_file_hit_across_configurations.
+    await buck.debug("flush-dep-files")
     result2 = await buck.build(
         target,
         "--target-platforms",
@@ -213,6 +218,32 @@ async def test_symlinked_dir_with_content_based_path(buck: Buck) -> None:
     await build_target_with_different_platforms_and_verify_output_paths_are_identical(
         buck, target
     )
+
+
+@buck_test()
+async def test_assembled_dir_with_content_based_path(buck: Buck) -> None:
+    target = "root//:assembled_dir_with_content_based_path"
+    await build_target_with_different_platforms_and_verify_output_paths_are_identical(
+        buck, target
+    )
+
+    # Entry modes must be honored: `assembled_dir.copy` entries are laid out
+    # as real bytes, `assembled_dir.symlink` entries as symlinks.
+    result = await buck.build(
+        target,
+        "--target-platforms",
+        "root//:p_default",
+        "--show-output",
+    )
+    path = result.get_target_to_build_output().get(target)
+    assert path is not None
+    out = buck.cwd / path
+    assert out.is_dir()
+    for name in ["copied", "copied_dep"]:
+        assert (out / name).is_file()
+        assert not (out / name).is_symlink()
+    for name in ["symlinked", "symlinked_dep"]:
+        assert (out / name).is_symlink()
 
 
 @buck_test()
@@ -492,6 +523,11 @@ async def test_run_action_with_incremental_metadata(buck: Buck) -> None:
         "--remote-only",
     )
     what_ran1 = await read_what_ran(buck)
+    # Flush the local dep file cache so the second (cross-configuration) build still goes through the
+    # RE path and shows up in what-ran. Otherwise it would be served by the cross-configuration local
+    # action cache (this action is dedupe-eligible), and what-ran would be empty. The cross-config
+    # local cache hit itself is covered by test_dep_files.py::test_dep_file_hit_across_configurations.
+    await buck.debug("flush-dep-files")
     await buck.build(
         target,
         "--target-platforms",

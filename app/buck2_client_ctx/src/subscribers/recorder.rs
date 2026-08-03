@@ -58,6 +58,7 @@ use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
 use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
+use buck2_hash::IntentionallyStdHashMap;
 use buck2_hash::StdBuckHashMap;
 use buck2_hash::StdBuckHashSet;
 use buck2_util::network_speed_average::NetworkSpeedAverage;
@@ -78,7 +79,7 @@ use crate::client_metadata::ClientMetadata;
 use crate::common::CommonBuildConfigurationOptions;
 use crate::common::CommonEventLogOptions;
 use crate::common::PreemptibleWhen;
-use crate::console_interaction_stream::SuperConsoleToggle;
+use crate::console_interaction_stream::ConsoleInteraction;
 use crate::exit_result::ExitResult;
 use crate::subscribers::classify_server_stderr::classify_server_stderr;
 use crate::subscribers::observer::ErrorObserver;
@@ -118,6 +119,7 @@ pub struct InvocationRecorder {
     re_experiment_name: Option<String>,
     persistent_cache_mode: Option<String>,
     critical_path_duration: Option<Duration>,
+    critical_path_page_in: Option<Duration>,
     tags: Vec<String>,
     run_local_count: u64,
     run_remote_count: u64,
@@ -168,6 +170,7 @@ pub struct InvocationRecorder {
     time_to_first_infra_failure_test_result: Option<Duration>,
 
     system_info: SystemInfo,
+    paging_summary: Option<buck2_data::PagingSummary>,
     file_watcher_stats: Option<buck2_data::FileWatcherStats>,
     file_watcher_duration: Option<Duration>,
     time_to_last_action_execution_end: Option<Duration>,
@@ -178,7 +181,7 @@ pub struct InvocationRecorder {
     sink_max_buffer_depth: u64,
     soft_error_categories: StdBuckHashSet<SoftError>,
     concurrent_command_blocking_duration: Option<Duration>,
-    metadata: StdBuckHashMap<String, String>,
+    metadata: IntentionallyStdHashMap<String, String>,
     analysis_count: u64,
     load_count: u64,
     daemon_in_memory_state_is_corrupted: bool,
@@ -335,6 +338,7 @@ impl InvocationRecorder {
             re_experiment_name: None,
             persistent_cache_mode: None,
             critical_path_duration: None,
+            critical_path_page_in: None,
             tags: vec![],
             run_local_count: 0,
             run_remote_count: 0,
@@ -382,6 +386,7 @@ impl InvocationRecorder {
             time_to_first_infra_failure_test_result: None,
             time_to_first_unknown_test_result: None,
             system_info: SystemInfo::default(),
+            paging_summary: None,
             file_watcher_stats: None,
             file_watcher_duration: None,
             time_to_last_action_execution_end: None,
@@ -771,7 +776,19 @@ impl InvocationRecorder {
         let mut page_in_fetch_us = None;
         let mut page_in_deser_us = None;
         let mut page_in_bytes = None;
-        let mut page_in_by_key_type = StdBuckHashMap::default();
+        let mut page_in_by_key_type = IntentionallyStdHashMap::new();
+
+        // Already a per-command delta from the daemon; sum across key types for
+        // the aggregate scalars.
+        if let Some(paging_summary) = &self.paging_summary
+            && !paging_summary.dice_page_in_by_key_type.is_empty()
+        {
+            page_in_by_key_type = paging_summary.dice_page_in_by_key_type.clone();
+            page_in_count = Some(page_in_by_key_type.values().map(|s| s.count).sum());
+            page_in_fetch_us = Some(page_in_by_key_type.values().map(|s| s.fetch_us).sum());
+            page_in_deser_us = Some(page_in_by_key_type.values().map(|s| s.deser_us).sum());
+            page_in_bytes = Some(page_in_by_key_type.values().map(|s| s.bytes).sum());
+        }
 
         if let Some(snapshot) = &self.last_snapshot {
             sink_success_count =
@@ -948,16 +965,6 @@ impl InvocationRecorder {
                 &self.initial_io_eden_settle_count,
             );
 
-            // Already a per-command delta from the daemon; sum across key types
-            // for the aggregate scalars.
-            if !snapshot.dice_page_in_by_key_type.is_empty() {
-                page_in_by_key_type = snapshot.dice_page_in_by_key_type.clone();
-                page_in_count = Some(page_in_by_key_type.values().map(|s| s.count).sum());
-                page_in_fetch_us = Some(page_in_by_key_type.values().map(|s| s.fetch_us).sum());
-                page_in_deser_us = Some(page_in_by_key_type.values().map(|s| s.deser_us).sum());
-                page_in_bytes = Some(page_in_by_key_type.values().map(|s| s.bytes).sum());
-            }
-
             // We show memory/disk warnings in the console but we can't emit a tag event there due to having no access to dispatcher.
             // Also, it suffices to only emit a single tag per invocation, not one tag each time memory pressure is exceeded.
             // We can't just rely on the last snapshot here instead we use the peak memory/disk usage to check if we ever reported a warning.
@@ -1017,6 +1024,7 @@ impl InvocationRecorder {
             cli_args: self.cli_args.clone(),
             representative_config_flags: self.representative_config_flags.clone(),
             critical_path_duration: self.critical_path_duration.and_then(|x| x.try_into().ok()),
+            critical_path_page_in: self.critical_path_page_in.and_then(|x| x.try_into().ok()),
             metadata: Some(metadata),
             tags: self.tags.drain(..).collect(),
             run_local_count: self.run_local_count,
@@ -1132,6 +1140,10 @@ impl InvocationRecorder {
             concurrent_command_ids: std::mem::take(&mut self.concurrent_command_ids)
                 .into_iter()
                 .collect(),
+            page_out_started: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.page_out_started),
             daemon_connection_failure: Some(self.daemon_connection_failure),
             daemon_was_started: self.daemon_was_started.map(|t| t as i32),
             should_restart: Some(self.should_restart),
@@ -1247,6 +1259,22 @@ impl InvocationRecorder {
             page_in_deser_us,
             page_in_bytes,
             page_in_by_key_type,
+            paging_db_size_bytes: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.paging_db_size_bytes),
+            paging_resident_node_count: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.resident_node_count),
+            paging_paged_out_node_count: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.paged_out_node_count),
+            paging_candidate_node_count: self
+                .paging_summary
+                .as_ref()
+                .and_then(|s| s.candidate_node_count),
             repo_path: self.repo_path.take(),
         };
 
@@ -1302,12 +1330,17 @@ impl InvocationRecorder {
     // Collects client-side state and data, suitable for telemetry.
     // NOTE: If data is visible from the daemon, put it in cli::metadata::collect()
     fn default_metadata() -> buck2_data::TypedMetadata {
-        let mut ints = StdBuckHashMap::default();
+        let mut ints = IntentionallyStdHashMap::new();
         ints.insert("is_tty".to_owned(), std::io::stderr().is_tty() as i64);
-        buck2_data::TypedMetadata {
-            ints,
-            strings: StdBuckHashMap::default(),
+        // `strings` is only mutated under the cfg-gated block below, so in any other build
+        // configuration (notably OSS) the `mut` is unused and trips `-D unused_mut`.
+        #[cfg_attr(not(all(fbcode_build, target_os = "linux")), allow(unused_mut))]
+        let mut strings = IntentionallyStdHashMap::new();
+        #[cfg(all(fbcode_build, target_os = "linux"))]
+        if let Some(agent_identity) = identity_env::agent_identity_from_env() {
+            strings.insert("client_agent_identity_from_env".to_owned(), agent_identity);
         }
+        buck2_data::TypedMetadata { ints, strings }
     }
 
     fn handle_command_start(
@@ -1791,14 +1824,23 @@ impl InvocationRecorder {
         _event: &BuckEvent,
     ) -> buck2_error::Result<()> {
         let mut duration = Duration::default();
+        let mut page_in = Duration::default();
 
         for node in &info.critical_path2 {
             if let Some(d) = &node.duration {
-                duration += d.try_into_duration()?;
+                let d = d.try_into_duration()?;
+                duration += d;
+                if matches!(
+                    node.entry,
+                    Some(buck2_data::critical_path_entry2::Entry::PageIn(_))
+                ) {
+                    page_in += d;
+                }
             }
         }
 
         self.critical_path_duration = Some(duration);
+        self.critical_path_page_in = Some(page_in);
         self.critical_path_backend = info.backend_name.clone();
         Ok(())
     }
@@ -2398,6 +2440,10 @@ impl InvocationRecorder {
                     buck2_data::instant_event::Data::SystemInfo(system_info) => {
                         self.handle_system_info(system_info)
                     }
+                    buck2_data::instant_event::Data::PagingSummary(paging_summary) => {
+                        self.paging_summary = Some(paging_summary.clone());
+                        Ok(())
+                    }
                     buck2_data::instant_event::Data::TargetCfg(target_cfg) => {
                         self.target_cfg = Some(target_cfg.clone());
                         Ok(())
@@ -2503,12 +2549,13 @@ impl EventSubscriber for InvocationRecorder {
 
     async fn handle_console_interaction(
         &mut self,
-        c: &Option<SuperConsoleToggle>,
+        c: &ConsoleInteraction,
     ) -> buck2_error::Result<()> {
-        if let Some(c) = c {
-            self.tags
-                .push(format!("superconsole-toggle:{}", c.key()).to_owned())
-        }
+        let ConsoleInteraction::Toggle(c) = c else {
+            return Ok(());
+        };
+        self.tags
+            .push(format!("superconsole-toggle:{}", c.key()).to_owned());
         Ok(())
     }
 

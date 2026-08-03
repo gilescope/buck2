@@ -1,0 +1,121 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is dual-licensed under either the MIT license found in the
+ * LICENSE-MIT file in the root directory of this source tree or the Apache
+ * License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+ * of this source tree. You may select, at your option, one of the
+ * above-listed licenses.
+ */
+
+use std::sync::Arc;
+
+use allocative::Allocative;
+use dupe::Dupe;
+use serde::Deserialize;
+
+struct SettingKey<T> {
+    internal_default: Option<T>,
+    oss_default: Option<T>,
+}
+
+impl<T: Clone> SettingKey<T> {
+    fn default_value(&self) -> Option<T> {
+        if cfg!(fbcode_build) {
+            self.internal_default.clone()
+        } else {
+            self.oss_default.clone()
+        }
+    }
+
+    fn resolve(&self, value: Option<T>) -> Option<T> {
+        value.or_else(|| self.default_value())
+    }
+}
+
+const LOG_URL: SettingKey<&'static str> = SettingKey {
+    internal_default: None,
+    oss_default: None,
+};
+
+const LOG_USE_MANIFOLD: SettingKey<bool> = SettingKey {
+    // None is a migration placeholder to support buckconfig fallback
+    internal_default: None,
+    oss_default: Some(false),
+};
+
+#[derive(Debug, Default, Deserialize, Allocative)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuckSettingsData {
+    log_use_manifold: Option<bool>,
+    log_url: Option<String>,
+}
+
+#[derive(Clone, Dupe, Debug, Allocative)]
+pub struct BuckSettings(pub(crate) Arc<BuckSettingsData>);
+
+impl BuckSettings {
+    pub fn empty() -> Self {
+        Self(Arc::new(BuckSettingsData::default()))
+    }
+
+    pub fn log_use_manifold(&self) -> Option<bool> {
+        LOG_USE_MANIFOLD.resolve(self.0.log_use_manifold)
+    }
+
+    pub fn log_url(&self) -> Option<&str> {
+        self.0
+            .log_url
+            .as_deref()
+            .or_else(|| LOG_URL.default_value())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    pub struct TestBuckSettingsData {
+        pub test_flag: Option<bool>,
+        pub test_section: Option<TestSection>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    pub struct TestSection {
+        pub test_value: Option<String>,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::parser::resolve;
+    use crate::settings::parser::table;
+
+    #[test]
+    fn test_default_log_use_manifold() {
+        let expected = if cfg!(fbcode_build) {
+            None
+        } else {
+            Some(false)
+        };
+        assert_eq!(BuckSettings::empty().log_use_manifold(), expected);
+    }
+
+    #[test]
+    fn test_log_use_manifold() -> buck2_error::Result<()> {
+        let settings = resolve(vec![table("log_use_manifold = false")])?;
+        assert_eq!(settings.log_use_manifold(), Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_url() -> buck2_error::Result<()> {
+        let settings = resolve(vec![table("log_url = \"test.com\"")])?;
+        assert_eq!(settings.log_url(), Some("test.com"));
+        Ok(())
+    }
+}

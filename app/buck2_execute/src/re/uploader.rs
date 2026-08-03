@@ -34,6 +34,7 @@ use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
 use buck2_error::internal_error;
+use buck2_hash::IntentionallyStdHashMap;
 use buck2_hash::StdBuckHashMap;
 use buck2_hash::StdBuckHashSet;
 use chrono::Duration;
@@ -62,6 +63,7 @@ use crate::directory::ReDirectorySerializer;
 use crate::execute::blobs::ActionBlobs;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
 use crate::materialize::materializer::CasDownloadInfo;
+use crate::materialize::materializer::MaterializationPurpose;
 use crate::materialize::materializer::Materializer;
 use crate::re::action_identity::ReActionIdentity;
 use crate::re::client::RemoteExecutionClient;
@@ -71,7 +73,7 @@ use crate::re::metadata::RemoteExecutionMetadataExt;
 #[derive(Clone, Debug, Default)]
 pub struct UploadStats {
     pub total: ReUploadMetrics,
-    pub by_extension: StdBuckHashMap<String, ReUploadMetrics>,
+    pub by_extension: IntentionallyStdHashMap<String, ReUploadMetrics>,
 }
 
 pub struct Uploader {}
@@ -178,7 +180,7 @@ impl Uploader {
             let client = client.clone();
             let metadata = use_case.metadata(identity);
             let digests = input_digests.iter().map(|d| d.to_re()).collect();
-            let digests_ttl = client.get_digests_ttl(digests, metadata).await;
+            let digests_ttl = client.get_digests_ttl(digests, &metadata, true).await;
 
             let input_digests = input_digests.iter().copied().collect();
 
@@ -400,7 +402,10 @@ impl Uploader {
 
         if !paths_to_materialize.is_empty() {
             materializer
-                .ensure_materialized(paths_to_materialize)
+                .ensure_materialized(
+                    paths_to_materialize,
+                    MaterializationPurpose::IntermediateOnly,
+                )
                 .await
                 .buck_error_context("Error materializing paths for upload")?;
         }
@@ -408,7 +413,7 @@ impl Uploader {
         // Compute stats of digests we're about to upload so we can report them
         // to the span end event of this stage of execution.
         let stats = {
-            let mut stats_by_extension = StdBuckHashMap::default();
+            let mut stats_by_extension = IntentionallyStdHashMap::new();
             let mut named_digest_byte_count: u64 = 0;
             for nd in &upload_files {
                 // Aggregate metrics by file extension.
@@ -444,7 +449,7 @@ impl Uploader {
                 client.get_session_id(),
                 client.get_raw_re_client()
                     .upload(
-                        use_case.metadata(identity),
+                        &use_case.metadata(identity),
                         UploadRequest {
                             files_with_digest: Some(upload_files),
                             inlined_blobs_with_digest: Some(upload_blobs),
@@ -456,7 +461,6 @@ impl Uploader {
                     )
                     .await,
             )
-            .await
             .map_err(|e| {
                 if e.tags().contains(&buck2_error::ErrorTag::ReInvalidArgument) {
                     buck2_error::buck2_error!(
@@ -474,6 +478,19 @@ impl Uploader {
         Ok(stats)
     }
 }
+
+#[cfg(fbcode_build)] // Relies on fbcode future sizes
+buck2_util::size_assert::words_of_async_fn_future!(
+    Uploader::upload,
+    (_, _, _, _, _, _, _, _, _, _),
+    ~327
+);
+#[cfg(fbcode_build)] // Relies on fbcode future sizes
+buck2_util::size_assert::words_of_async_fn_future!(
+    Uploader::find_missing,
+    (_, _, _, _, _, _, _),
+    ~260
+);
 
 fn should_error_for_missing_digest(info: &CasDownloadInfo) -> bool {
     // RE sometimes reports things that exist as missing. We don't fully understand why at this
@@ -677,7 +694,7 @@ fn query_digest_ttls<'s>(
     let digests = input_digests.iter().map(|d| d.to_re()).collect();
 
     async move {
-        let digests_ttl = client.get_digests_ttl(digests, metadata).await;
+        let digests_ttl = client.get_digests_ttl(digests, &metadata, true).await;
 
         {
             let mut guard = deduper.lock().expect("Poisoned lock");

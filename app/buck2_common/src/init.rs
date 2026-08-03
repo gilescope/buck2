@@ -16,11 +16,13 @@ use buck2_core::buck2_env;
 use buck2_error::BuckErrorContext;
 #[cfg(unix)]
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+use dice::PagableStorageBackend;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::legacy_configs::configs::LegacyBuckConfig;
 use crate::legacy_configs::key::BuckconfigKeyRef;
+use crate::settings::BuckSettings;
 
 pub const DEFAULT_RETAINED_EVENT_LOGS: usize = 12;
 
@@ -352,9 +354,9 @@ impl FromStr for ResourceControlInit {
 const RESOURCE_CONTROL_ALGO_VERSION: u32 = 6;
 
 /// The current version of the daemon cgroup wrapping logic. Incrementing this to `N + 1` and
-/// setting `buck2_resource_control.status_if_min_daemon_cgroup_version` buckconfig to `N + 1`
-/// enables daemon cgroup wrapping (status = if_available) only if the bug fix is included in the
-/// version of buck in use.
+/// setting `buck2_resource_control.min_version_for_gated_status` buckconfig to `N + 1` enables the
+/// gated default status (`buck2_resource_control.version_gated_default_status`, defaulting to
+/// `if_available`) only if the bug fix is included in the version of buck in use.
 const DAEMON_CGROUP_VERSION: u32 = 1;
 
 impl ResourceControlConfig {
@@ -365,23 +367,29 @@ impl ResourceControlConfig {
         )? {
             Self::deserialize(env_conf)
         } else {
-            let status = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "status",
-                })?
-                .unwrap_or(ResourceControlStatus::Off);
-            let status_if_min_daemon_cgroup_version: Option<u32> =
-                config.parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "status_if_min_daemon_cgroup_version",
-                })?;
-            let status = if status_if_min_daemon_cgroup_version
-                .is_some_and(|min_version| DAEMON_CGROUP_VERSION >= min_version)
-            {
-                ResourceControlStatus::IfAvailable
-            } else {
+            let status: Option<ResourceControlStatus> = config.parse(BuckconfigKeyRef {
+                section: "buck2_resource_control",
+                property: "status",
+            })?;
+            let status = if let Some(status) = status {
                 status
+            } else {
+                let min_version_for_gated_status: Option<u32> = config.parse(BuckconfigKeyRef {
+                    section: "buck2_resource_control",
+                    property: "min_version_for_gated_status",
+                })?;
+                if min_version_for_gated_status
+                    .is_some_and(|min_version| DAEMON_CGROUP_VERSION >= min_version)
+                {
+                    config
+                        .parse(BuckconfigKeyRef {
+                            section: "buck2_resource_control",
+                            property: "version_gated_default_status",
+                        })?
+                        .unwrap_or(ResourceControlStatus::IfAvailable)
+                } else {
+                    ResourceControlStatus::Off
+                }
             };
             let init = config
                 .parse(BuckconfigKeyRef {
@@ -502,6 +510,69 @@ impl HealthCheckConfig {
     }
 }
 
+/// Pagable DICE storage settings, present (`Some`) only when paging is enabled —
+/// either `buck2_hydration.enable_paging` or `buck2_hydration.page_out_on_idle`
+/// (which implies it). When present, the daemon sets up on-disk storage during
+/// construction so `buck2 debug hydration` can page node values out to / in from
+/// disk. Read at startup because it gates that setup.
+#[derive(Allocative, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HydrationConfig {
+    /// On-disk backend for pagable storage.
+    pub pagable_storage_backend: PagableStorageBackend,
+    /// Automatically page the graph out to disk when the daemon goes idle.
+    pub page_out_on_idle: bool,
+    /// Idle page-out only runs when at least this many GiB of disk are free to
+    /// write the paged-out values to.
+    pub page_out_min_free_disk_gb: u64,
+    /// Allow automatic idle page-out to run more than once per daemon.
+    pub allow_multiple_idle_page_outs: bool,
+}
+
+impl HydrationConfig {
+    /// Returns `None` when neither `buck2_hydration.enable_paging` nor
+    /// `page_out_on_idle` is set.
+    fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Option<Self>> {
+        let page_out_on_idle = config
+            .parse(BuckconfigKeyRef {
+                section: "buck2_hydration",
+                property: "page_out_on_idle",
+            })?
+            .unwrap_or(false);
+        // `page_out_on_idle` implies pagable storage, so it enables it too.
+        let enabled = page_out_on_idle
+            || config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2_hydration",
+                    property: "enable_paging",
+                })?
+                .unwrap_or(false);
+        if !enabled {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            pagable_storage_backend: config
+                .parse::<PagableStorageBackend>(BuckconfigKeyRef {
+                    section: "buck2_hydration",
+                    property: "pagable_storage_backend",
+                })?
+                .unwrap_or_default(),
+            page_out_on_idle,
+            page_out_min_free_disk_gb: config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2_hydration",
+                    property: "page_out_min_free_disk_gb",
+                })?
+                .unwrap_or(100),
+            allow_multiple_idle_page_outs: config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2_hydration",
+                    property: "allow_multiple_idle_page_outs",
+                })?
+                .unwrap_or(false),
+        }))
+    }
+}
+
 /// Configurations that are used at startup by the daemon. Those are actually read by the client,
 /// and passed on to the daemon.
 ///
@@ -527,29 +598,37 @@ pub struct DaemonStartupConfig {
     pub retained_event_logs: usize,
     pub macos_qos_class: Option<String>,
     pub daemon_idle_timeout_s: Option<u64>,
+    /// Pagable DICE storage settings, or `None` when paging is disabled.
+    pub hydration: Option<HydrationConfig>,
 }
 
 impl DaemonStartupConfig {
-    pub fn new(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+    pub fn new(config: &LegacyBuckConfig, settings: &BuckSettings) -> buck2_error::Result<Self> {
         // Intepreted client side because we need the value here.
 
         let log_download_method = {
             // Determine the log download method to use. Only default to
             // manifold in fbcode contexts, or when specifically asked.
-            let use_manifold_default = cfg!(fbcode_build);
-            let use_manifold = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "log_use_manifold",
-                })?
-                .unwrap_or(use_manifold_default);
+            let use_manifold = settings
+                .log_use_manifold()
+                .map(Ok::<_, buck2_error::Error>)
+                .unwrap_or_else(|| {
+                    Ok(config
+                        .parse(BuckconfigKeyRef {
+                            section: "buck2",
+                            property: "log_use_manifold",
+                        })?
+                        .unwrap_or(cfg!(fbcode_build)))
+                })?;
 
             if use_manifold {
                 Ok(LogDownloadMethod::Manifold)
             } else {
-                let log_url = config.get(BuckconfigKeyRef {
-                    section: "buck2",
-                    property: "log_url",
+                let log_url = settings.log_url().or_else(|| {
+                    config.get(BuckconfigKeyRef {
+                        section: "buck2",
+                        property: "log_url",
+                    })
                 });
                 if let Some(log_url) = log_url {
                     if log_url.is_empty() {
@@ -638,6 +717,7 @@ impl DaemonStartupConfig {
                 section: "buck2",
                 property: "daemon_idle_timeout_s",
             })?,
+            hydration: HydrationConfig::from_config(config)?,
         })
     }
 
@@ -669,6 +749,7 @@ impl DaemonStartupConfig {
             retained_event_logs: DEFAULT_RETAINED_EVENT_LOGS,
             macos_qos_class: None,
             daemon_idle_timeout_s: None,
+            hydration: None,
         }
     }
 }
@@ -683,7 +764,7 @@ mod tests {
     #[test]
     fn test_daemon_idle_timeout_s_default() -> buck2_error::Result<()> {
         let config = parse(&[("config", indoc!(r#""#))], "config")?;
-        let startup_config = DaemonStartupConfig::new(&config)?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty())?;
         assert_eq!(startup_config.daemon_idle_timeout_s, None);
         Ok(())
     }
@@ -702,7 +783,7 @@ mod tests {
             )],
             "config",
         )?;
-        let startup_config = DaemonStartupConfig::new(&config)?;
+        let startup_config = DaemonStartupConfig::new(&config, &BuckSettings::empty())?;
         assert_eq!(startup_config.daemon_idle_timeout_s, Some(10800));
         Ok(())
     }

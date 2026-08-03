@@ -102,6 +102,7 @@ use rand::SeedableRng;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tonic::Code;
 use tonic::Request;
 use tonic::Response;
@@ -120,8 +121,10 @@ use crate::daemon::server_allocative::spawn_allocative;
 use crate::daemon::state::DaemonState;
 use crate::daemon::state::DaemonStateData;
 use crate::file_status::file_status_command;
+use crate::hydration::hydration_command;
 use crate::lsp::run_lsp_server_command;
 use crate::new_generic::new_generic_command;
+use crate::paging::cancel_active_page_out;
 use crate::profile::profile_command;
 use crate::profiling_manager::StarlarkProfilingManager;
 use crate::snapshot;
@@ -145,9 +148,10 @@ struct DaemonShutdown {
 
     /// This channel is used to trigger a graceful shutdown of the grpc server. After
     /// an item is sent on this channel, the server will start rejecting new requests
-    /// and once current requests are finished the server will shutdown.
+    /// and once current requests are finished the server will shutdown. The item is
+    /// the deadline for completing the graceful shutdown.
     #[allocative(skip)]
-    shutdown_channel: UnboundedSender<()>,
+    shutdown_channel: UnboundedSender<tokio::time::Instant>,
 }
 
 impl DaemonShutdown {
@@ -163,9 +167,10 @@ impl DaemonShutdown {
         crate::active_commands::broadcast_shutdown(&reason);
 
         let timeout = timeout.unwrap_or(DEFAULT_KILL_TIMEOUT);
+        let shutdown_deadline = tokio::time::Instant::now() + timeout;
 
         // Ignore errors on shutdown_channel as that would mean we've already started shutdown;
-        let _ = self.shutdown_channel.unbounded_send(());
+        let _ = self.shutdown_channel.unbounded_send(shutdown_deadline);
         self.delegate
             .force_shutdown_with_timeout(reason.to_string(), timeout);
     }
@@ -187,13 +192,19 @@ impl BuckdServerInitPreferences {
         digest_config: DigestConfig,
         root_config: &LegacyBuckConfig,
         tenting_acl_provider: Option<Arc<dyn TentingAclProvider>>,
+        dice_state_path: &Path,
     ) -> buck2_error::Result<Arc<Dice>> {
+        // `hydration` is `Some` when paging is enabled (via `enable_paging` or
+        // `page_out_on_idle`), which is what gates setting up on-disk storage.
+        let hydration = self.daemon_startup_config.hydration.as_ref();
         configure_dice_for_buck(
             io,
             digest_config,
             Some(root_config),
             self.detect_cycles,
             tenting_acl_provider,
+            hydration.map(|_| dice_state_path),
+            hydration.map_or_else(Default::default, |h| h.pagable_storage_backend),
         )
         .await
     }
@@ -274,7 +285,8 @@ impl BuckdServer {
         let now = SystemTime::now();
         let now = now.duration_since(SystemTime::UNIX_EPOCH)?;
 
-        let (shutdown_channel, shutdown_receiver): (UnboundedSender<()>, _) = mpsc::unbounded();
+        let (shutdown_channel, shutdown_receiver): (UnboundedSender<tokio::time::Instant>, _) =
+            mpsc::unbounded();
         let (command_channel, command_receiver): (UnboundedSender<()>, _) = mpsc::unbounded();
 
         let materializations = MaterializationMethod::try_new_from_config_value(
@@ -321,6 +333,7 @@ impl BuckdServer {
             )
             .await?,
         );
+        let dice = daemon_state.data().dice_manager.unsafe_dice().dupe();
 
         #[cfg(fbcode_build)]
         {
@@ -356,7 +369,7 @@ impl BuckdServer {
             rt,
         }));
 
-        let shutdown =
+        let (shutdown, shutdown_deadline) =
             server_shutdown_signal(command_receiver, shutdown_receiver, daemon_idle_timeout_s)?;
         let server = Server::builder()
             .layer(InterceptorLayer::new(BuckCheckAuthTokenInterceptor {
@@ -378,7 +391,19 @@ impl BuckdServer {
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
         }
 
-        server.await?;
+        let server_result = server.await;
+
+        let shutdown_deadline = shutdown_deadline
+            .await
+            .unwrap_or_else(|_| tokio::time::Instant::now() + DEFAULT_KILL_TIMEOUT);
+        if timeout_at(shutdown_deadline, dice.wait_for_idle())
+            .await
+            .is_err()
+        {
+            tracing::warn!("timed out waiting for DICE tasks to finish during shutdown");
+        }
+
+        server_result?;
 
         Ok(())
     }
@@ -485,7 +510,23 @@ impl BuckdServer {
             daemon_shutdown_channel,
             state,
         } = ActiveCommand::new(&dispatch, client_ctx.sanitized_argv.clone());
+
+        // A command that contends for the DICE graph is starting; cancel any
+        // in-progress idle page-out so it yields resources back. Read-only /
+        // debug commands opt out (see `triggers_idle_page_out`).
+        if opts.triggers_idle_page_out() {
+            cancel_active_page_out();
+        }
+
         let data = daemon_state.data();
+
+        // The total disk space on `buck-out`, effectively fixed for the daemon's life.
+        // Captured here alongside `SystemInfo` and handed to this command's
+        // `PagingManager`, which pairs it with the command-end snapshot's used-disk
+        // reading to gate idle page-out without a second disk stat.
+        let total_disk_space_bytes = disk_space_stats(daemon_state.paths.buck_out_path())
+            .ok()
+            .map(|DiskSpaceStats { total_space, .. }| total_space);
 
         // Fire off a system-wide event to record the memory usage of this process.
         // TODO(ezgi): add it to oneshot command too
@@ -494,9 +535,7 @@ impl BuckdServer {
             system_total_memory_bytes: Some(system_memory_stats()),
             memory_pressure_threshold_percent: system_warning_config
                 .memory_pressure_threshold_percent,
-            total_disk_space_bytes: disk_space_stats(daemon_state.paths.buck_out_path())
-                .ok()
-                .map(|DiskSpaceStats { total_space, .. }| total_space),
+            total_disk_space_bytes,
             remaining_disk_space_threshold_gb: system_warning_config
                 .remaining_disk_space_threshold_gb,
             min_re_download_bytes_threshold: system_warning_config.min_re_download_bytes_threshold,
@@ -602,6 +641,7 @@ impl BuckdServer {
                             snapshot_collector,
                             cancellations,
                             command_start,
+                            total_disk_space_bytes,
                         )?;
 
                         let res = func(
@@ -614,7 +654,9 @@ impl BuckdServer {
                         )
                         .await;
 
-                        context.finalize().await?;
+                        // Finalize the command, emitting its paging telemetry and (if
+                        // eligible) scheduling an idle page-out.
+                        context.finalize(opts.triggers_idle_page_out()).await?;
                         res?
                     };
 
@@ -1109,9 +1151,9 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<ResponseStream>, Status> {
         self.run_streaming(
             req,
-            DefaultCommandOptions,
+            HydrationCommandOptions,
             |context, partial_result_dispatcher, req| {
-                crate::hydration::hydration_command(context, partial_result_dispatcher, req).boxed()
+                hydration_command(context, partial_result_dispatcher, req).boxed()
             },
         )
         .await
@@ -1124,7 +1166,7 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<ResponseStream>, Status> {
         self.run_streaming(
             req,
-            DefaultCommandOptions,
+            NonPagingCommandOptions,
             |context, partial_result_dispatcher, req| {
                 file_status_command(context, partial_result_dispatcher, req).boxed()
             },
@@ -1415,8 +1457,15 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<UnstableAllocatorStatsResponse>, Status> {
         self.check_if_accepting_requests()?;
 
-        let response = memory::allocator_stats(&req.into_inner().options)
-            .buck_error_context("Failed to retrieve allocator stats");
+        let req = req.into_inner();
+        let response = if req.purge {
+            memory::purge_jemalloc()
+                .buck_error_context("Failed to purge jemalloc")
+                .and_then(|()| memory::allocator_stats(&req.options))
+        } else {
+            memory::allocator_stats(&req.options)
+        }
+        .buck_error_context("Failed to retrieve allocator stats");
 
         match response {
             Ok(response) => Ok(Response::new(UnstableAllocatorStatsResponse { response })),
@@ -1610,7 +1659,7 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<Self::SubscriptionStream>, Status> {
         self.run_bidirectional(
             req,
-            DefaultCommandOptions,
+            NonPagingCommandOptions,
             |ctx,
              partial_result_dispatcher,
              _client_ctx,
@@ -1675,7 +1724,7 @@ impl DaemonApi for BuckdServer {
     ) -> Result<Response<ResponseStream>, Status> {
         self.run_streaming(
             req,
-            DefaultCommandOptions,
+            NonPagingCommandOptions,
             |context, _: PartialResultDispatcher<NoPartialResult>, req| {
                 trace_io_command(context, req).boxed()
             },
@@ -1700,13 +1749,25 @@ trait StreamingCommandOptions<Req>: OneshotCommandOptions {
     ) -> buck2_error::Result<StarlarkProfilerConfiguration> {
         Ok(StarlarkProfilerConfiguration::None)
     }
+
+    /// Whether this command takes part in the idle page-out lifecycle: it cancels
+    /// an in-progress page-out when it starts, and triggers a new one when it
+    /// finishes. True for commands that contend for the DICE graph; false for
+    /// read-only / non-graph commands (see `NonPagingCommandOptions`,
+    /// `HydrationCommandOptions`), which neither cancel nor trigger.
+    fn triggers_idle_page_out(&self) -> bool {
+        true
+    }
 }
 
 fn server_shutdown_signal(
     command_receiver: UnboundedReceiver<()>,
-    mut shutdown_receiver: UnboundedReceiver<()>,
+    mut shutdown_receiver: UnboundedReceiver<tokio::time::Instant>,
     daemon_idle_timeout_s: Option<u64>,
-) -> buck2_error::Result<impl Future<Output = ()>> {
+) -> buck2_error::Result<(
+    impl Future<Output = ()>,
+    oneshot::Receiver<tokio::time::Instant>,
+)> {
     let mut duration = daemon_idle_timeout_s
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_INACTIVITY_TIMEOUT);
@@ -1718,15 +1779,24 @@ fn server_shutdown_signal(
         duration = Duration::from_secs(1);
     }
 
-    Ok(async move {
+    let (shutdown_deadline_sender, shutdown_deadline_receiver) = oneshot::channel();
+
+    let shutdown = async move {
         let timeout = inactivity_timeout(command_receiver, duration);
         let shutdown = shutdown_receiver.next();
 
         futures::pin_mut!(shutdown);
         futures::pin_mut!(timeout);
 
-        futures::future::select(timeout, shutdown).await;
-    })
+        let shutdown_deadline = match futures::future::select(timeout, shutdown).await {
+            futures::future::Either::Left(_) => tokio::time::Instant::now() + DEFAULT_KILL_TIMEOUT,
+            futures::future::Either::Right((shutdown_deadline, _)) => shutdown_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + DEFAULT_KILL_TIMEOUT),
+        };
+        let _ = shutdown_deadline_sender.send(shutdown_deadline);
+    };
+
+    Ok((shutdown, shutdown_deadline_receiver))
 }
 
 async fn inactivity_timeout(mut command_receiver: UnboundedReceiver<()>, duration: Duration) {
@@ -1827,6 +1897,31 @@ impl OneshotCommandOptions for DefaultCommandOptions {}
 
 impl<Req> StreamingCommandOptions<Req> for DefaultCommandOptions {}
 
+/// Options for `debug hydration`. Its subcommands manage the idle page-out
+/// directly (see `hydration_command`), so starting one must not cancel it.
+struct HydrationCommandOptions;
+
+impl OneshotCommandOptions for HydrationCommandOptions {}
+
+impl<Req> StreamingCommandOptions<Req> for HydrationCommandOptions {
+    fn triggers_idle_page_out(&self) -> bool {
+        false
+    }
+}
+
+/// Options for commands that reach the daemon but do no DICE graph work —
+/// `debug trace-io`, `debug file-status`, and `subscribe`. They don't contend
+/// with a background idle page-out, so starting one leaves it running.
+struct NonPagingCommandOptions;
+
+impl OneshotCommandOptions for NonPagingCommandOptions {}
+
+impl<Req> StreamingCommandOptions<Req> for NonPagingCommandOptions {
+    fn triggers_idle_page_out(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1840,9 +1935,10 @@ mod tests {
         tokio::time::pause();
 
         let (_cmd_tx, cmd_rx) = mpsc::unbounded::<()>();
-        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<()>();
+        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<tokio::time::Instant>();
 
-        let shutdown_future = server_shutdown_signal(cmd_rx, shutdown_rx, Some(2)).unwrap();
+        let (shutdown_future, shutdown_deadline) =
+            server_shutdown_signal(cmd_rx, shutdown_rx, Some(2)).unwrap();
         futures::pin_mut!(shutdown_future);
 
         let result = tokio::time::timeout(Duration::from_secs(1), &mut shutdown_future).await;
@@ -1850,6 +1946,10 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(2), &mut shutdown_future).await;
         assert!(result.is_ok(), "should shut down after idle timeout");
+        assert_eq!(
+            tokio::time::Instant::now() + DEFAULT_KILL_TIMEOUT,
+            shutdown_deadline.await.unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1857,9 +1957,9 @@ mod tests {
         tokio::time::pause();
 
         let (_cmd_tx, cmd_rx) = mpsc::unbounded::<()>();
-        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<()>();
+        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<tokio::time::Instant>();
 
-        let shutdown_future = server_shutdown_signal(cmd_rx, shutdown_rx, None).unwrap();
+        let (shutdown_future, _) = server_shutdown_signal(cmd_rx, shutdown_rx, None).unwrap();
         futures::pin_mut!(shutdown_future);
 
         let result = tokio::time::timeout(Duration::from_secs(3600), &mut shutdown_future).await;
@@ -1871,9 +1971,9 @@ mod tests {
         tokio::time::pause();
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded::<()>();
-        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<()>();
+        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<tokio::time::Instant>();
 
-        let shutdown_future = server_shutdown_signal(cmd_rx, shutdown_rx, Some(3)).unwrap();
+        let (shutdown_future, _) = server_shutdown_signal(cmd_rx, shutdown_rx, Some(3)).unwrap();
         futures::pin_mut!(shutdown_future);
 
         tokio::time::advance(Duration::from_secs(2)).await;
@@ -1887,5 +1987,21 @@ mod tests {
             result.is_ok(),
             "should shut down after idle timeout post-reset"
         );
+    }
+
+    #[tokio::test]
+    async fn test_server_shutdown_preserves_deadline() {
+        tokio::time::pause();
+
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded::<()>();
+        let (shutdown_tx, shutdown_rx) = mpsc::unbounded();
+        let (shutdown_future, shutdown_deadline) =
+            server_shutdown_signal(cmd_rx, shutdown_rx, None).unwrap();
+        let expected_deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+
+        shutdown_tx.unbounded_send(expected_deadline).unwrap();
+        shutdown_future.await;
+
+        assert_eq!(expected_deadline, shutdown_deadline.await.unwrap());
     }
 }
