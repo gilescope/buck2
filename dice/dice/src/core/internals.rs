@@ -39,9 +39,9 @@ use crate::versions::VersionNumber;
 
 /// Core state of DICE, holding the actual graph and version information
 #[derive(allocative::Allocative)]
-pub(super) struct CoreState {
-    version_tracker: VersionTracker,
-    graph: VersionedGraph,
+pub(crate) struct CoreState {
+    pub(crate) version_tracker: VersionTracker,
+    pub(crate) graph: VersionedGraph,
     pending_termination_tasks: Vec<DiceTask>,
 }
 
@@ -147,11 +147,20 @@ impl CoreState {
 
     /// Evict in-memory values for the given nodes, marking them as paged out
     /// with their `DataKey`s. Skips nodes that are missing, vacant, or injected.
-    pub(super) fn evict_keys(&mut self, keys: Vec<(DiceKey, DataKey)>) {
-        for (key, data_key) in keys {
+    ///
+    /// Checked: each entry carries the value that was serialized, and the node
+    /// is only paged out if it still holds that exact value (pointer identity).
+    /// Pressure eviction runs while builds are live, so a node can be
+    /// recomputed between serialization and this message arriving - blindly
+    /// paging out would pair the new value's node with stale on-disk bytes.
+    pub(super) fn evict_keys(&mut self, keys: Vec<(DiceKey, DataKey, DiceValidValue)>) {
+        for (key, data_key, serialized) in keys {
             if let Some(mut node) = self.graph.node_mut(key) {
                 if let VersionedGraphNode::Occupied(occ) = &mut *node {
-                    occ.set_paged_out(data_key);
+                    match occ.val().as_hydrated() {
+                        Some(current) if current.ptr_eq(&serialized) => occ.set_paged_out(data_key),
+                        _ => {}
+                    }
                 }
             }
         }

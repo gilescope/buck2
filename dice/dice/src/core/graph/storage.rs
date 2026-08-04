@@ -484,6 +484,49 @@ impl VersionedGraph {
         }
     }
 
+    /// Persist support: install nodes reconstructed from a snapshot into an
+    /// empty graph, then re-derive every rdep edge from the persisted dep
+    /// lists. rdeps are load-bearing for invalidation (a leaf change
+    /// propagates dirt through them), so a loaded graph without them would
+    /// serve stale values.
+    pub(crate) fn install_persisted_nodes(
+        &mut self,
+        nodes: Vec<(DiceKey, VersionedGraphNode)>,
+        at_version: VersionNumber,
+    ) {
+        assert!(
+            self.nodes.nodes().is_empty(),
+            "persisted snapshot must load into an empty graph"
+        );
+        let edges: Vec<(DiceKey, DiceKey)> = nodes
+            .iter()
+            .filter_map(|(k, node)| match node {
+                VersionedGraphNode::Occupied(occ) => {
+                    let (deps, _, _) = occ.parts_for_persist();
+                    Some(deps.iter_keys().map(|dep| (dep, *k)).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        // Insert through the vacant slot rather than the raw map: it is the choke
+        // point that keeps the page-out candidate index and the resident /
+        // paged-out tallies in sync.
+        for (key, node) in nodes {
+            match self.nodes.node_entry(key) {
+                NodeEntry::Vacant(slot) => slot.insert(node),
+                NodeEntry::Occupied(_) => {
+                    unreachable!("snapshot keys are unique and the graph was empty")
+                }
+            }
+        }
+        for (dep, rdep) in edges {
+            if let Some(mut node) = self.nodes.node_mut(dep) {
+                node.add_rdep_at(at_version, rdep);
+            }
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         // We clear out almost everything except for injected keys - injected keys at old versions
         // can't be recomputed, so we need to retain them.

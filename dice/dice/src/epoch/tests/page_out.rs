@@ -37,21 +37,21 @@ use crate::dice::Dice;
 
 /// Per-test compute counter, injected via `UserComputationData` so tests don't share state.
 #[derive(Clone, Dupe)]
-struct ComputeCounter(Arc<AtomicUsize>);
+pub(super) struct ComputeCounter(pub(super) Arc<AtomicUsize>);
 
 impl ComputeCounter {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(Arc::new(AtomicUsize::new(0)))
     }
 
-    fn count(&self) -> usize {
+    pub(super) fn count(&self) -> usize {
         self.0.load(Ordering::SeqCst)
     }
 }
 
 #[derive(Allocative, Clone, Dupe, Debug, Display, PartialEq, Eq, Hash, Pagable)]
 #[pagable_typetag(DiceKeyDyn)]
-struct PagableKey(u32);
+pub(super) struct PagableKey(pub(super) u32);
 
 #[async_trait]
 impl Key for PagableKey {
@@ -246,13 +246,13 @@ impl Key for DeferredPagableKey {
     }
 }
 
-fn make_dice(storage: DiceStorage) -> Arc<Dice> {
+pub(super) fn make_dice(storage: DiceStorage) -> Arc<Dice> {
     let mut builder = Dice::builder();
     builder.set_pagable_storage(storage);
     builder.build(DetectCycles::Disabled)
 }
 
-fn user_data_with_counter(counter: &ComputeCounter) -> UserComputationData {
+pub(super) fn user_data_with_counter(counter: &ComputeCounter) -> UserComputationData {
     let mut d = UserComputationData::new();
     d.data.set(counter.dupe());
     d

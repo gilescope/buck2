@@ -31,7 +31,7 @@ use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::Weak;
 
 use allocative::Allocative;
@@ -389,7 +389,14 @@ struct FrozenFrozenHeap {
     name: Option<FrozenHeapName>,
     peak_allocated_bytes: Option<usize>,
     #[allocative(skip)]
-    ser_state: OnceLock<Weak<StarlarkSerState>>,
+    /// The serialization state holding a cached reference to this heap, so
+    /// `Drop` can unregister it. `Weak::new()` means unregistered.
+    ///
+    /// Replaceable rather than a `OnceLock`: a heap can outlive the session that
+    /// serialized it - the globals heap outlives every session - and must then
+    /// be registerable with the next one. At most one *live* state at a time
+    /// still holds; see [`FrozenFrozenHeap::register_ser_state`].
+    ser_state: Mutex<Weak<StarlarkSerState>>,
 }
 
 #[derive(Clone, Dupe, Allocative)]
@@ -412,13 +419,23 @@ unsafe impl Sync for FrozenFrozenHeap {}
 unsafe impl Send for FrozenFrozenHeap {}
 
 impl FrozenFrozenHeap {
+    /// Claim this heap for `state`, so the heap's `Drop` unregisters itself from
+    /// that state's resident-heap map.
+    ///
+    /// At most one *live* state may hold a heap - two live states sharing one is
+    /// the genuine ambiguity this rejects, since `Drop` can only notify one of
+    /// them. A claim by a state that has since been dropped is stale and is
+    /// replaced: without that, a heap outliving its first session (the globals
+    /// heap outlives all of them) could never be serialized again.
     fn register_ser_state(&self, state: &Arc<StarlarkSerState>) -> pagable::Result<()> {
-        let state = Arc::downgrade(state);
-        let registered = self.ser_state.get_or_init(|| state.dupe());
-        if Weak::ptr_eq(registered, &state) {
-            Ok(())
-        } else {
-            Err(PagableError::HeapRegisteredWithDifferentSerState.into())
+        let mut registered = self.ser_state.lock().unwrap();
+        match registered.upgrade() {
+            Some(live) if Arc::ptr_eq(&live, state) => Ok(()),
+            Some(_) => Err(PagableError::HeapRegisteredWithDifferentSerState.into()),
+            None => {
+                *registered = Arc::downgrade(state);
+                Ok(())
+            }
         }
     }
 
@@ -624,7 +641,7 @@ impl FrozenFrozenHeap {
             refs,
             name: Some(name),
             peak_allocated_bytes: None,
-            ser_state: OnceLock::new(),
+            ser_state: Mutex::new(Weak::new()),
         });
         let arena_ptr: *const Arena<ChunkAllocator> = &heap.arena;
 
@@ -645,7 +662,10 @@ impl Drop for FrozenFrozenHeap {
         let Some(name) = &self.name else {
             return;
         };
-        let Some(state) = self.ser_state.get().and_then(Weak::upgrade) else {
+        // Collect under the lock, then release it before calling back into the
+        // states, which take locks of their own.
+        let state = self.ser_state.get_mut().ok().and_then(|s| s.upgrade());
+        let Some(state) = state else {
             return;
         };
         state.unregister_heap(
@@ -894,6 +914,19 @@ impl FrozenHeapRef {
         items.0.into_iter()
     }
 
+    /// Instrumentation: visit every string allocated on this heap (not the
+    /// heaps reachable via [`refs`](FrozenHeapRef::refs) - walk those
+    /// yourself to avoid double-visiting shared heaps). Used for the
+    /// duplicate-string attribution behind freeze-time interning (L1 of
+    /// buck2's dice tail-memory plan).
+    pub fn for_each_string(&self, mut f: impl FnMut(&str)) {
+        for v in self.iter_values() {
+            if let Some(s) = v.to_value().unpack_str() {
+                f(s);
+            }
+        }
+    }
+
     /// See [`Arena::build_chunk_index`].
     pub(crate) fn build_chunk_index(&self) -> Vec<ChunkInfo> {
         match &self.0 {
@@ -961,13 +994,15 @@ impl FrozenHeap {
         if arena.is_empty() && refs.is_empty() {
             FrozenHeapRef::default()
         } else {
-            FrozenHeapRef(Some(Arc::new(FrozenFrozenHeap {
+            let heap = Arc::new(FrozenFrozenHeap {
                 arena,
                 refs: refs.into_iter().collect(),
                 name,
                 peak_allocated_bytes,
-                ser_state: OnceLock::new(),
-            })))
+                ser_state: Mutex::new(Weak::new()),
+            });
+            register_frozen_heap(&heap);
+            FrozenHeapRef(Some(heap))
         }
     }
 
@@ -1263,6 +1298,37 @@ impl<'v> Heap<'v> {
     }
 }
 
+/// Global registry of live frozen heaps, for whole-process instrumentation
+/// (duplicate-string attribution across all modules - see buck2's dice
+/// tail-memory plan). Weak entries: registration never extends a heap's
+/// lifetime, and dead entries are pruned amortized on push and on read.
+static FROZEN_HEAP_REGISTRY: std::sync::Mutex<Vec<std::sync::Weak<FrozenFrozenHeap>>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn register_frozen_heap(heap: &Arc<FrozenFrozenHeap>) {
+    let mut registry = FROZEN_HEAP_REGISTRY.lock().unwrap();
+    // Amortized O(1): prune dead entries only when the next push would grow
+    // the allocation, so a churn of short-lived heaps cannot leak the vec.
+    if registry.len() == registry.capacity() {
+        registry.retain(|w| w.strong_count() > 0);
+    }
+    registry.push(Arc::downgrade(heap));
+}
+
+/// Instrumentation: every non-empty frozen heap currently alive in this
+/// process (empty heaps freeze to a shared default and are not registered),
+/// in registration (freeze) order. Cost of maintaining the registry is one
+/// mutex push per freeze; this call is O(live + dead-since-last-prune).
+pub fn all_live_frozen_heaps() -> Vec<FrozenHeapRef> {
+    let mut registry = FROZEN_HEAP_REGISTRY.lock().unwrap();
+    registry.retain(|w| w.strong_count() > 0);
+    registry
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .map(|arc| FrozenHeapRef(Some(arc)))
+        .collect()
+}
+
 /// Used to perform garbage collection by [`Trace::trace`](crate::values::Trace::trace).
 pub struct Tracer<'v> {
     arena: Arena<Bump>,
@@ -1340,6 +1406,34 @@ mod tests {
     where
         FrozenHeapRef: Send + Sync,
     {
+    }
+
+    #[test]
+    fn test_frozen_heap_registry_tracks_lifetime() {
+        // Unique markers so parallel tests' heaps can't false-positive.
+        const M1: &str = "frozen-heap-registry-marker-one";
+        const M2: &str = "frozen-heap-registry-marker-two";
+        let heap = crate::values::FrozenHeap::new();
+        heap.alloc(M1);
+        heap.alloc(M2);
+        let heap_ref = heap.into_ref_impl(None, None);
+
+        let find = || {
+            super::all_live_frozen_heaps()
+                .iter()
+                .filter(|h| {
+                    let (mut one, mut two) = (false, false);
+                    h.for_each_string(|s| {
+                        one |= s == M1;
+                        two |= s == M2;
+                    });
+                    one && two
+                })
+                .count()
+        };
+        assert_eq!(find(), 1, "freeze registers the heap; walk sees strings");
+        drop(heap_ref);
+        assert_eq!(find(), 0, "dropped heap is pruned from the registry");
     }
 
     #[test]

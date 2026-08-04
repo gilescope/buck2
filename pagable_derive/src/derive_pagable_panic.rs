@@ -43,7 +43,13 @@ fn derive_pagable_panic_impl(
         #[allow(unused)]
         impl #ser_impl_generics pagable::PagableSerialize for #name #type_generics #where_clause {
                 fn pagable_serialize(&self, serializer: &mut dyn pagable::PagableSerializer) -> pagable::__internal::anyhow::Result<()> {
-                    unimplemented!()
+                    // Decline rather than panic: the workspace builds with
+                    // panic=abort, so an unimplemented!() here kills the
+                    // daemon the first time a value of this type is paged.
+                    Err(pagable::__internal::anyhow::anyhow!(concat!(
+                        stringify!(#name),
+                        " does not support pagable serialization"
+                    )))
                 }
         }
     };
@@ -52,7 +58,10 @@ fn derive_pagable_panic_impl(
         #[allow(unused)]
         impl #de_impl_generics pagable::PagableDeserialize<'de> for #name #type_generics #where_clause {
             fn pagable_deserialize<De: pagable::PagableDeserializer<'de> + ?Sized>(deserializer: &mut De) -> pagable::Result<Self> {
-                unimplemented!()
+                Err(pagable::__internal::anyhow::anyhow!(concat!(
+                    stringify!(#name),
+                    " does not support pagable deserialization"
+                )))
             }
         }
     };

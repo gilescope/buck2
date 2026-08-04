@@ -93,6 +93,17 @@ impl DiceKeyErased {
         }
     }
 
+    /// Persist support. Projections never appear as injected nodes, so the
+    /// fallback is unreachable in practice.
+    pub(crate) fn invalidation_source_priority(
+        &self,
+    ) -> crate::api::key::InvalidationSourcePriority {
+        match self {
+            DiceKeyErased::Key(k) => k.invalidation_source_priority(),
+            DiceKeyErased::Projection(..) => crate::api::key::InvalidationSourcePriority::Normal,
+        }
+    }
+
     pub(crate) fn hash(&self) -> u64 {
         match self {
             DiceKeyErased::Key(k) => k.hash(),
@@ -290,6 +301,16 @@ impl<'a> CowDiceKeyHashed<'a> {
     pub(crate) fn into_cow(self) -> CowDiceKey<'a> {
         self.cow
     }
+
+    /// Persist support: intern an already-erased key (snapshot load path,
+    /// where keys arrive as deserialized `DiceKeyErased`, not concrete types).
+    pub(crate) fn from_erased(key: DiceKeyErased) -> CowDiceKeyHashed<'static> {
+        let hash = key.hash();
+        CowDiceKeyHashed {
+            cow: CowDiceKey::Owned(key),
+            hash,
+        }
+    }
 }
 
 impl Display for CowDiceKeyHashed<'_> {
@@ -320,6 +341,10 @@ pub trait DiceKeyDyn: Allocative + Display + Send + Sync + PagableTagged + 'stat
     fn storage_type(&self) -> StorageType;
 
     fn provide<'a>(&'a self, demand: &mut Demand<'a>);
+
+    /// Persist support: the key's declared invalidation-source priority
+    /// (needed to reconstruct injected nodes from a snapshot).
+    fn invalidation_source_priority(&self) -> crate::api::key::InvalidationSourcePriority;
 
     /// Serializes a value associated with this key via the key's `ValueSerialize`.
     fn pagable_serialize_value(
@@ -375,6 +400,10 @@ where
 
     fn provide<'a>(&'a self, demand: &mut Demand<'a>) {
         K::provide(self, demand)
+    }
+
+    fn invalidation_source_priority(&self) -> crate::api::key::InvalidationSourcePriority {
+        K::invalidation_source_priority()
     }
 
     fn pagable_serialize_value(
@@ -500,6 +529,17 @@ pub(crate) struct ProjectionWithBase {
 }
 
 impl ProjectionWithBase {
+    /// Persist support: reassemble from a deserialized projection dyn and a
+    /// remapped base key.
+    pub(crate) fn from_persisted_parts(base: DiceKey, proj: StdArc<dyn DiceProjectionDyn>) -> Self {
+        ProjectionWithBase { base, proj }
+    }
+
+    /// Persist support: the dyn projection, Arc'd, for typetag serialization.
+    pub(crate) fn proj_arc(&self) -> &StdArc<dyn DiceProjectionDyn> {
+        &self.proj
+    }
+
     pub(crate) fn base(&self) -> DiceKey {
         self.base
     }

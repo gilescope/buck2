@@ -69,6 +69,18 @@ impl VersionNumber {
     pub fn testing_value(self) -> usize {
         self.0.get()
     }
+
+    /// Persist support: the raw counter, for serialization.
+    pub(crate) fn value_for_persist(self) -> usize {
+        self.0.get()
+    }
+
+    /// Persist support: rebuild from [`value_for_persist`](Self::value_for_persist).
+    /// `None` for zero rather than a panic - the value comes off disk, so it is
+    /// untrusted.
+    pub(crate) fn from_persisted_value(num: usize) -> Option<Self> {
+        NonZeroUsize::new(num).map(VersionNumber)
+    }
 }
 
 impl Sub for VersionNumber {
@@ -95,6 +107,21 @@ mod introspection {
 pub(crate) struct VersionRange {
     begin: VersionNumber,
     end: Option<VersionNumber>,
+}
+
+impl VersionRange {
+    /// Persist support: raw parts.
+    pub(crate) fn parts_for_persist(&self) -> (VersionNumber, Option<VersionNumber>) {
+        (self.begin, self.end)
+    }
+
+    /// Persist support: rebuild from `parts_for_persist` output.
+    pub(crate) fn from_persisted_parts(begin: VersionNumber, end: Option<VersionNumber>) -> Self {
+        if let Some(e) = end {
+            debug_assert!(begin < e, "VersionRange begin must precede end");
+        }
+        VersionRange { begin, end }
+    }
 }
 
 impl Display for VersionRange {
@@ -285,6 +312,24 @@ impl Display for VersionRanges {
 }
 
 impl VersionRanges {
+    /// Persist support: the raw sorted interval list.
+    pub(crate) fn ranges_for_persist(&self) -> &[VersionRange] {
+        &self.0
+    }
+
+    /// Persist support: rebuild from intervals saved by `ranges_for_persist`.
+    /// Caller must supply the same sorted, non-overlapping list this type
+    /// maintains internally.
+    pub(crate) fn from_persisted_ranges(ranges: Vec<VersionRange>) -> Self {
+        debug_assert!(
+            ranges
+                .windows(2)
+                .all(|w| w[0].end.is_some() && w[0].end.unwrap() < w[1].begin),
+            "persisted VersionRanges must be sorted and non-overlapping"
+        );
+        VersionRanges(ranges.into_iter().collect())
+    }
+
     /// Returns the last range if this is non-empty.
     pub(crate) fn last(&self) -> Option<VersionRange> {
         self.0.last().copied()

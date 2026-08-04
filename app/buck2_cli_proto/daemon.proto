@@ -969,6 +969,9 @@ enum HydrationSubcommand {
   PAGE_OUT = 0;
   PAGE_IN = 1;
   STATUS = 2;
+  // Duplicate-string histogram over all live frozen Starlark heaps.
+  // Sizes the freeze-time interning win (L1 of the dice tail-memory plan).
+  DUP_STRINGS = 3;
 }
 
 message HydrationRequest {

@@ -13,6 +13,7 @@ Run a crate's Cargo buildscript.
 import argparse
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -164,11 +165,32 @@ def ensure_rustc_available(
         sys.exit(1)
 
 
+# chmod +x for every class, spelled out: the file may be consumed by a
+# different uid than the one that staged it, so healing only the owner
+# bit would leave the same failure for group/other.
+EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+
+
 def run_buildscript(
     buildscript: str,
     env: dict[str, str],
     cwd: Path,
 ) -> str:
+    # Heal a mode-stripped staging: REAPI blob transfers carry no modes,
+    # so executability is a chain of custody that can break at any hop
+    # (bank seed, canonical-hit is_executable provenance). chmod at the
+    # point of use covers every source; exec only, never +w - the file
+    # may be a hardlinked CAS inode whose no-write defense must hold.
+    if not os.access(buildscript, os.X_OK):
+        try:
+            st = os.stat(buildscript)
+            os.chmod(buildscript, st.st_mode | EXEC_BITS)
+            print(
+                f"buildscript_run: healed exec bit on {buildscript}",
+                file=sys.stderr,
+            )
+        except OSError:
+            pass
     try:
         return subprocess.check_output(
             os.path.abspath(buildscript),
@@ -177,7 +199,17 @@ def run_buildscript(
             cwd=cwd,
         )
     except OSError as ex:
-        print(f"Failed to run {buildscript} because {ex}", file=sys.stderr)
+        # Forensics for EACCES-class failures: is the staged file a real
+        # executable, a mode-stripped copy, or a directory?
+        try:
+            st = os.stat(buildscript, follow_symlinks=False)
+            detail = f"mode={oct(st.st_mode)} size={st.st_size}"
+        except OSError as stat_ex:
+            detail = f"stat failed: {stat_ex}"
+        print(
+            f"Failed to run {buildscript} because {ex} ({detail})",
+            file=sys.stderr,
+        )
         sys.exit(1)
     except subprocess.CalledProcessError as ex:
         sys.exit(ex.returncode)

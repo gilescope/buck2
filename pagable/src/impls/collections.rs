@@ -247,7 +247,10 @@ impl<'de, T: PagableDeserialize<'de>> PagableDeserialize<'de> for Vec<T> {
     }
 }
 
-impl<T: PagableSerialize, const N: usize> PagableSerialize for smallvec::SmallVec<[T; N]> {
+impl<T: PagableSerialize, const N: usize> PagableSerialize for smallvec::SmallVec<[T; N]>
+where
+    [T; N]: smallvec::Array<Item = T>,
+{
     fn pagable_serialize(&self, serializer: &mut dyn PagableSerializer) -> crate::Result<()> {
         usize::serialize(&self.len(), serializer.serde())?;
         for v in self {
@@ -259,6 +262,8 @@ impl<T: PagableSerialize, const N: usize> PagableSerialize for smallvec::SmallVe
 
 impl<'de, T: PagableDeserialize<'de>, const N: usize> PagableDeserialize<'de>
     for smallvec::SmallVec<[T; N]>
+where
+    [T; N]: smallvec::Array<Item = T>,
 {
     fn pagable_deserialize<D: PagableDeserializer<'de> + ?Sized>(
         deserializer: &mut D,

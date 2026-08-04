@@ -15,7 +15,8 @@
 //! Serialization is performed via the bridging methods on [`DiceKeyDyn`] /
 //! [`DiceProjectionDyn`], which delegate to each concrete `Key`'s `value_serialize()`.
 //!
-//! See `Dice::page_out` for the user-facing entry point.
+//! See `Dice::page_out` (idle, whole-graph) and `Dice::evict_under_pressure`
+//! (mid-build, targeted) for the user-facing entry points.
 
 use std::fmt;
 use std::fmt::Display;
@@ -149,6 +150,23 @@ impl DiceStorage {
             path: None,
             cached_db_size_bytes: Arc::new(ArcSwap::new(Arc::new(Ok(0)))),
         }
+    }
+
+    /// Persist support: the underlying backend, for storing/fetching the
+    /// snapshot's key blobs alongside the paged values.
+    pub(crate) fn storage(&self) -> &Arc<dyn PagableStorage> {
+        &self.storage
+    }
+
+    /// Persist support: serialize one value into the store, returning its
+    /// content-addressed key. `None` = the key's `ValueSerialize` declined.
+    pub(crate) fn store_value_blob(
+        &self,
+        key_dyn: &DiceKeyErased,
+        value: DiceValidValue,
+        finished: &DashMap<usize, Arc<ArcSerSlot>>,
+    ) -> anyhow::Result<Option<DataKey>> {
+        self.page_out_value(key_dyn, value, finished)
     }
 
     /// Cumulative page-in counters per key type since this `DiceStorage` was
@@ -286,8 +304,11 @@ impl DiceStorage {
             if cancelled() {
                 break;
             }
-            if let Some(data_key) = self.page_out_value(&key_dyn, value, finished)? {
-                pending_evictions.push((dice_key, data_key));
+            if let Some(data_key) = self.page_out_value(&key_dyn, value.dupe(), finished)? {
+                // The value rides along so the state thread can skip nodes
+                // recomputed since serialization (pressure eviction runs
+                // while builds are live).
+                pending_evictions.push((dice_key, data_key, value));
                 if pending_evictions.len() >= EVICT_BATCH_SIZE {
                     state_handle.evict_keys(std::mem::replace(
                         &mut pending_evictions,
@@ -316,12 +337,27 @@ impl DiceStorage {
     ) -> anyhow::Result<Option<DataKey>> {
         let session_context = self.storage.session_context();
         let mut serializer = SerializerForPaging::new(session_context);
-        let serialize_result = match key_dyn {
-            DiceKeyErased::Key(k) => k.pagable_serialize_value(value.as_dyn(), &mut serializer),
-            DiceKeyErased::Projection(p) => p
-                .proj()
-                .pagable_serialize_value(value.as_dyn(), &mut serializer),
-        };
+        // Some value types deliberately panic on serialization (PagablePanic
+        // derives mark not-yet-implemented support, e.g. bundled-cell file
+        // ops). Treat a panic as "declines to serialize": the value stays
+        // resident, nothing is lost. AssertUnwindSafe: the serializer and
+        // its buffered output are discarded on the panic path.
+        let serialize_result =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match key_dyn {
+                DiceKeyErased::Key(k) => k.pagable_serialize_value(value.as_dyn(), &mut serializer),
+                DiceKeyErased::Projection(p) => p
+                    .proj()
+                    .pagable_serialize_value(value.as_dyn(), &mut serializer),
+            })) {
+                Ok(r) => r,
+                Err(_) => {
+                    tracing::debug!(
+                        "value serialization panicked for `{}`; keeping resident",
+                        key_dyn.key_type_name()
+                    );
+                    return Ok(None);
+                }
+            };
         match serialize_result {
             None => {
                 tracing::debug!(
@@ -330,16 +366,43 @@ impl DiceStorage {
                 );
                 Ok(None)
             }
-            Some(Err(e)) => Err(e),
+            Some(Err(e)) => {
+                // A value that fails to serialize stays resident - one bad
+                // value must not fail the whole page-out.
+                tracing::debug!(
+                    "value serialization failed for `{}`; keeping resident: {e:#}",
+                    key_dyn.key_type_name()
+                );
+                Ok(None)
+            }
             Some(Ok(())) => {
                 let (data, arcs) = serializer.finish();
-                match self
-                    .storage
-                    .page_out_item(data, arcs, finished, session_context)
-                {
-                    Ok(key) => Ok(Some(key)),
-                    Err(PageOutError::Failed(e)) => Err(e),
-                    Err(PageOutError::AlreadyFailed) => Ok(None),
+                // Nested Arc values serialize lazily inside page_out_item;
+                // a PagablePanic type buried in an arc detonates there, not
+                // in the top-level serialize above. Same policy: panic =
+                // declines, value stays resident.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.storage
+                        .page_out_item(data, arcs, finished, session_context)
+                })) {
+                    Ok(Ok(key)) => Ok(Some(key)),
+                    Ok(Err(PageOutError::Failed(e))) => {
+                        // Includes nested-arc serialization failures (they
+                        // surface here, not in the top-level serialize).
+                        tracing::debug!(
+                            "page-out failed for `{}`; keeping resident: {e:#}",
+                            key_dyn.key_type_name()
+                        );
+                        Ok(None)
+                    }
+                    Ok(Err(PageOutError::AlreadyFailed)) => Ok(None),
+                    Err(_) => {
+                        tracing::debug!(
+                            "nested-arc serialization panicked for `{}`; keeping resident",
+                            key_dyn.key_type_name()
+                        );
+                        Ok(None)
+                    }
                 }
             }
         }

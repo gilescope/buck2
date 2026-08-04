@@ -120,6 +120,19 @@ where
         self.value.write_hash(hasher)
     }
 
+    fn equals(&self, other: Value<'v>) -> crate::Result<bool> {
+        // Enum elements are interned per type, so same-heap comparisons are
+        // caught by the pointer fast path before reaching here. Cross-heap
+        // comparisons (a page-in/persisted value vs the live module's
+        // element) must compare the stable type id plus element index - the
+        // same rule `EnumTypeMatcher` uses for type membership. Without
+        // this, a deserialized enum value never equals its own literal.
+        match EnumValue::from_value(other) {
+            Some(other) => Ok(self.id == other.id && self.index == other.index),
+            None => Ok(false),
+        }
+    }
+
     fn get_methods() -> Option<&'static Methods>
     where
         Self: Sized,

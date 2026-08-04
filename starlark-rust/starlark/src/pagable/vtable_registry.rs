@@ -42,7 +42,7 @@ use crate::values::layout::vtable::AValueVTable;
 /// string but as a compact `u32` index into the vtable registry. The index is
 /// assigned by sorting all registered type names, so it depends only on the set
 /// of registered types and is therefore stable across runs of the same binary.
-/// See [`VtableRegistry`].
+/// See the crate-private `VtableRegistry` in this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeserTypeId(pub &'static str);
 

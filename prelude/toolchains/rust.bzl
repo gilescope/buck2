@@ -50,6 +50,7 @@ def _system_rust_toolchain_impl(ctx):
             nightly_features = ctx.attrs.nightly_features,
             report_unused_deps = ctx.attrs.report_unused_deps,
             rustc_binary_flags = ctx.attrs.rustc_binary_flags,
+            rustc_env = ctx.attrs.rustc_env,
             rustc_flags = ctx.attrs.rustc_flags,
             rustc_target_triple = ctx.attrs.rustc_target_triple,
             rustc_test_flags = ctx.attrs.rustc_test_flags,
@@ -70,6 +71,11 @@ system_rust_toolchain = rule(
         "nightly_features": attrs.bool(default = True),
         "report_unused_deps": attrs.bool(default = False),
         "rustc_binary_flags": attrs.list(attrs.arg(), default = []),
+        # Extra env for every rustc invocation. Enters the action key, so
+        # values must be deterministic (e.g. SOURCE_DATE_EPOCH = "0" for
+        # reproducible builds - rustc then passes /Brepro to link.exe on
+        # MSVC and timestamp-embedding crates emit a fixed epoch).
+        "rustc_env": attrs.dict(key = attrs.string(), value = attrs.string(), default = {}),
         "rustc_flags": attrs.list(attrs.arg(), default = []),
         "rustc_target_triple": attrs.string(default = _DEFAULT_TRIPLE),
         "rustc_test_flags": attrs.list(attrs.arg(), default = []),

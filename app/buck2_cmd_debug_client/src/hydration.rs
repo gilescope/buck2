@@ -32,6 +32,9 @@ pub enum HydrationCommand {
     PageIn(PageInCommand),
     /// Summarize which DICE node values are resident in memory vs paged out.
     Status(StatusCommand),
+    /// Histogram of duplicate strings across all live frozen Starlark heaps
+    /// (sizes the freeze-time interning win).
+    DupStrings(DupStringsCommand),
 }
 
 #[derive(Debug, clap::Parser)]
@@ -56,19 +59,28 @@ pub struct StatusCommand {
     event_log_opts: CommonEventLogOptions,
 }
 
+#[derive(Debug, clap::Parser)]
+pub struct DupStringsCommand {
+    #[clap(flatten)]
+    event_log_opts: CommonEventLogOptions,
+}
+
 impl HydrationCommand {
     fn subcommand(&self) -> HydrationSubcommand {
         match self {
             HydrationCommand::PageOut(_) => HydrationSubcommand::PageOut,
             HydrationCommand::PageIn(_) => HydrationSubcommand::PageIn,
             HydrationCommand::Status(_) => HydrationSubcommand::Status,
+            HydrationCommand::DupStrings(_) => HydrationSubcommand::DupStrings,
         }
     }
 
     fn wait(&self) -> bool {
         match self {
             HydrationCommand::Status(c) => c.wait,
-            HydrationCommand::PageOut(_) | HydrationCommand::PageIn(_) => false,
+            HydrationCommand::PageOut(_)
+            | HydrationCommand::PageIn(_)
+            | HydrationCommand::DupStrings(_) => false,
         }
     }
 }
@@ -119,6 +131,7 @@ impl StreamingCommand for HydrationCommand {
             HydrationCommand::PageOut(c) => &c.event_log_opts,
             HydrationCommand::PageIn(c) => &c.event_log_opts,
             HydrationCommand::Status(c) => &c.event_log_opts,
+            HydrationCommand::DupStrings(c) => &c.event_log_opts,
         }
     }
 

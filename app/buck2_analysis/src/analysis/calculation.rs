@@ -57,7 +57,6 @@ use buck2_util::time_span::TimeSpan;
 use dice::CancellationContext;
 use dice::DiceComputations;
 use dice::Key;
-use dice::OkPagableValueSerialize;
 use dice::ValueSerialize;
 use dupe::Dupe;
 use dupe::IterDupedExt;
@@ -117,7 +116,53 @@ impl Key for AnalysisKey {
     }
 
     fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
-        OkPagableValueSerialize::<Self::Value>::new()
+        AnalysisValueSerialize
+    }
+}
+
+/// `OkPagableValueSerialize` semantics (Ok pages, Err stays resident).
+/// Analysis results serialize in full by default - provider heaps included
+/// (cross-heap enum equality made this sound; see EnumValueGen::equals).
+/// `BUCK2_DICE_SNAPSHOT_ACTIONS_ONLY=1` re-enables the S3 dodge: strip the
+/// frozen heap, keep the action graph. Action lookups always survive; on
+/// stripped values, provider reads return the standard "missing analysis
+/// storage" error.
+struct AnalysisValueSerialize;
+
+impl ValueSerialize for AnalysisValueSerialize {
+    type Value = buck2_error::Result<MaybeCompatible<AnalysisResult>>;
+
+    fn pagable_serialize_value(
+        &self,
+        v: &Self::Value,
+        ser: &mut dyn pagable::PagableSerializer,
+    ) -> Option<pagable::Result<()>> {
+        use pagable::PagableSerialize;
+        let Ok(v) = v else {
+            return None;
+        };
+        let strip = std::env::var_os("BUCK2_DICE_SNAPSHOT_ACTIONS_ONLY").is_some();
+        if strip {
+            let stripped = match v {
+                MaybeCompatible::Compatible(r) => {
+                    MaybeCompatible::Compatible(r.actions_only_for_persist())
+                }
+                MaybeCompatible::Incompatible(r) => MaybeCompatible::Incompatible(r.dupe()),
+            };
+            Some(stripped.pagable_serialize(ser))
+        } else {
+            Some(v.pagable_serialize(ser))
+        }
+    }
+
+    fn pagable_deserialize_value<'de, D: pagable::PagableDeserializer<'de> + ?Sized>(
+        &self,
+        deser: &mut D,
+    ) -> pagable::Result<Self::Value> {
+        use pagable::PagableDeserialize;
+        Ok(Ok(MaybeCompatible::<AnalysisResult>::pagable_deserialize(
+            deser,
+        )?))
     }
 }
 

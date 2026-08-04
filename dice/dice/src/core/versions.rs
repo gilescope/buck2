@@ -82,6 +82,17 @@ impl VersionTracker {
         self.current
     }
 
+    /// Persist support: resume version numbering where a loaded snapshot left
+    /// off. Only valid on a fresh tracker with no active versions.
+    pub(crate) fn fast_forward_for_persist(&mut self, v: VersionNumber) {
+        debug_assert!(
+            self.active_versions.is_empty(),
+            "fast_forward_for_persist on a tracker with active versions"
+        );
+        debug_assert!(self.current <= v, "fast-forward must not go backwards");
+        self.current = v;
+    }
+
     pub(crate) fn at(&mut self, v: VersionNumber) -> (VersionEpoch, SharedCache) {
         let entry = self.active_versions.entry(v).or_insert_with(|| {
             let version_epoch = self.epoch_tracker.next();

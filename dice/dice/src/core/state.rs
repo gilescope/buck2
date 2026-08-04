@@ -41,6 +41,8 @@ use crate::epoch::evaluator::VersionEpochState;
 use crate::epoch::task::dice::DiceTask;
 use crate::key::DiceKey;
 use crate::metrics::Metrics;
+use crate::persist_ext::PersistRequest;
+use crate::pressure::PressureRequest;
 use crate::updater::ActiveTransactionGuard;
 use crate::updater::ChangeType;
 use crate::value::DiceComputedValue;
@@ -119,7 +121,7 @@ impl CoreStateHandle {
         Self { tx, counters }
     }
 
-    fn request(&self, message: StateRequest) {
+    pub(crate) fn request(&self, message: StateRequest) {
         self.counters.record_enqueue();
         self.tx.send(message).expect("dice runner died");
     }
@@ -131,7 +133,7 @@ impl CoreStateHandle {
         self.counters.approx_depth()
     }
 
-    fn call<T>(
+    pub(crate) fn call<T>(
         &self,
         message: StateRequest,
         recv: Receiver<T>,
@@ -280,8 +282,10 @@ impl CoreStateHandle {
 
     /// Evict in-memory values for the given nodes, marking them as paged out.
     /// Fire-and-forget; any subsequent state requests are guaranteed to see
-    /// the evicted state because state requests are processed FIFO.
-    pub(crate) fn evict_keys(&self, keys: Vec<(DiceKey, DataKey)>) {
+    /// the evicted state because state requests are processed FIFO. Each entry
+    /// carries the serialized value; a node holding a different value by the
+    /// time the message lands is skipped (see `CoreState::evict_keys`).
+    pub(crate) fn evict_keys(&self, keys: Vec<(DiceKey, DataKey, DiceValidValue)>) {
         self.request(StateRequest::EvictKeys { keys })
     }
 
@@ -346,7 +350,7 @@ pub(crate) fn init_state() -> CoreStateHandle {
 }
 
 /// Core state is accessed via message passing to a single threaded processor
-pub(super) enum StateRequest {
+pub(crate) enum StateRequest {
     /// Updates the core state with the given set of changes. The new VersionNumber that should be
     /// used is sent back via the channel provided
     UpdateState {
@@ -354,7 +358,9 @@ pub(super) enum StateRequest {
         resp: Sender<VersionNumber>,
     },
     /// Gets the current version number
-    CurrentVersion { resp: Sender<VersionNumber> },
+    CurrentVersion {
+        resp: Sender<VersionNumber>,
+    },
     /// Obtains the shared state ctx at the given version
     CtxAtVersion {
         version: VersionNumber,
@@ -362,7 +368,9 @@ pub(super) enum StateRequest {
         resp: Sender<(VersionEpochState, ActiveTransactionGuard)>,
     },
     /// Report that a computation context at a version has been dropped
-    DropCtxAtVersion { version: VersionNumber },
+    DropCtxAtVersion {
+        version: VersionNumber,
+    },
     /// Lookup the state of a key
     LookupKey {
         key: VersionedGraphKey,
@@ -397,7 +405,9 @@ pub(super) enum StateRequest {
         resp: Sender<TransactionResult<DiceComputedValue>>,
     },
     /// Get all the tasks pending cancellation
-    GetTasksPendingCancellation { resp: Sender<Vec<DiceTask>> },
+    GetTasksPendingCancellation {
+        resp: Sender<Vec<DiceTask>>,
+    },
     /// For unstable take
     UnstableDropEverything,
     /// Collect the keys of all paged-out graph nodes.
@@ -405,22 +415,40 @@ pub(super) enum StateRequest {
         resp: Sender<anyhow::Result<Vec<(DiceKey, DataKey)>>>,
     },
     /// Classify graph nodes as resident vs paged out.
-    PagableStatus { resp: Sender<PagableStatusRaw> },
+    PagableStatus {
+        resp: Sender<PagableStatusRaw>,
+    },
     /// Resident, paged-out, and candidate node counts, read O(1) from the core-state
     /// tallies.
-    PagableNodeCounts { resp: Sender<PagableNodeCounts> },
+    PagableNodeCounts {
+        resp: Sender<PagableNodeCounts>,
+    },
     /// Collect nodes that need serialization before they can be paged out.
     KeysToPageOut {
         resp: Sender<Vec<(DiceKey, DiceValidValue)>>,
     },
-    /// Mark nodes as paged out, dropping their in-memory values.
-    EvictKeys { keys: Vec<(DiceKey, DataKey)> },
+    /// Mark nodes as paged out, dropping their in-memory values (checked
+    /// against the serialized value's identity).
+    EvictKeys {
+        keys: Vec<(DiceKey, DataKey, DiceValidValue)>,
+    },
     /// Mark nodes that page-out could not serialize.
-    MarkNonPageable { keys: Vec<DiceKey> },
+    MarkNonPageable {
+        keys: Vec<DiceKey>,
+    },
     /// Replace the paged-out value at `key` with its hydrated form.
-    Rehydrate { key: DiceKey, value: DiceValidValue },
+    Rehydrate {
+        key: DiceKey,
+        value: DiceValidValue,
+    },
+    /// Fork additions, one variant each so this enum and the processor's match
+    /// gain a single line per feature rather than one per request.
+    Pressure(PressureRequest),
+    Persist(PersistRequest),
     /// Collect metrics
-    Metrics { resp: Sender<Metrics> },
+    Metrics {
+        resp: Sender<Metrics>,
+    },
     /// Collects the introspectable dice state
     Introspection {
         resp: Sender<(VersionedGraphIntrospectable, VersionIntrospectable)>,

@@ -411,6 +411,12 @@ impl PagableNodeValue {
         }
     }
 
+    /// Persist support: a value that exists only on disk (snapshot load).
+    /// The worker hydrates it on first demand, same as after a page-out.
+    pub(crate) fn paged_out_for_persist(data_key: DataKey) -> Self {
+        PagableNodeValue::PagedOut(data_key)
+    }
+
     /// The hydrated value, panicking with `msg` if it is paged out. `msg` should
     /// explain why the caller knows the value is resident (analogous to
     /// `Option::expect`).
@@ -513,6 +519,34 @@ impl ForceDirtyHistory {
         Self { versions: None }
     }
 
+    /// Persist support: the raw force-dirty versions and their source
+    /// priority. This history is load-bearing (see `restricted_range`):
+    /// a persister must round-trip it verbatim or stale reuse becomes
+    /// possible across a force-dirtied version.
+    pub(crate) fn parts_for_persist(
+        &self,
+    ) -> Option<(&[VersionNumber], InvalidationSourcePriority)> {
+        self.versions.as_ref().map(|b| (b.0.as_slice(), b.1))
+    }
+
+    /// Persist support: rebuild from `parts_for_persist` output.
+    pub(crate) fn from_persisted_parts(
+        versions: Vec<VersionNumber>,
+        priority: InvalidationSourcePriority,
+    ) -> Self {
+        debug_assert!(
+            versions.windows(2).all(|w| w[0] < w[1]),
+            "force-dirty versions must be strictly increasing"
+        );
+        if versions.is_empty() {
+            Self { versions: None }
+        } else {
+            Self {
+                versions: Some(Box::new((versions, priority))),
+            }
+        }
+    }
+
     /// Marks a version as force-dirtied. Returns true if the version was not already marked.
     ///
     /// Should only ever be called at increasing version numbers.
@@ -602,6 +636,40 @@ impl OccupiedGraphNode {
             },
             invalidation_paths,
         }
+    }
+
+    /// Persist support: reconstruct a node whose value lives in the snapshot
+    /// store. rdeps start empty (the loader re-adds edges from the persisted
+    /// dep lists); invalidation paths reset to clean.
+    pub(crate) fn new_paged_out_for_persist(
+        key: DiceKey,
+        data_key: DataKey,
+        deps: Arc<SeriesParallelDeps>,
+        verified_ranges: VersionRanges,
+        dirtied_history: ForceDirtyHistory,
+    ) -> Self {
+        Self {
+            key,
+            res: PagableNodeValue::paged_out_for_persist(data_key),
+            metadata: NodeMetadata {
+                deps,
+                rdeps: LazyDepsSet::new(),
+                verified_ranges: verified_ranges.into_arc(),
+                dirtied_history,
+            },
+            invalidation_paths: TrackedInvalidationPaths::clean(),
+        }
+    }
+
+    /// Persist support: the metadata a snapshot must capture.
+    pub(crate) fn parts_for_persist(
+        &self,
+    ) -> (&Arc<SeriesParallelDeps>, &VersionRanges, &ForceDirtyHistory) {
+        (
+            &self.metadata.deps,
+            &self.metadata.verified_ranges,
+            &self.metadata.dirtied_history,
+        )
     }
 
     pub(crate) fn mark_unchanged(
@@ -785,8 +853,19 @@ impl OccupiedGraphNode {
             .intersect_range(VersionRange::bounded(VersionNumber::FIRST, v))
     }
 
-    fn rdeps(&self) -> impl Iterator<Item = DiceKey> {
+    pub(crate) fn rdeps(&self) -> impl Iterator<Item = DiceKey> {
         self.metadata.rdeps.iter()
+    }
+
+    /// Begin of the most recent verified range - the closest thing the graph
+    /// tracks to "when this value was last (re)computed". Used as the coldness
+    /// rank for pressure eviction; never-verified nodes rank coldest.
+    pub(crate) fn last_verified_begin(&self) -> VersionNumber {
+        self.metadata
+            .verified_ranges
+            .last()
+            // Version numbers start at one, so `FIRST` is the coldest rank there is.
+            .map_or(VersionNumber::FIRST, |r| r.begin())
     }
 
     pub(crate) fn deps(&self) -> &Arc<SeriesParallelDeps> {
@@ -915,6 +994,14 @@ impl InjectedGraphNode {
     pub(crate) fn latest(&self) -> &InjectedNodeData {
         // We don't ever create an empty values map
         self.values.values().next_back().unwrap()
+    }
+
+    /// Persist support: the latest injected value and the version it became
+    /// valid at. Older history is dead weight after a restart - a snapshot
+    /// keeps only the newest entry.
+    pub(crate) fn latest_for_persist(&self) -> (VersionNumber, &DiceValidValue) {
+        let data = self.latest();
+        (data.first_valid_version, &data.value)
     }
 
     fn new_node_data(value: DiceValidValue, version: VersionNumber) -> InjectedNodeData {

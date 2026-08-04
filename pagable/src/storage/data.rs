@@ -93,6 +93,23 @@ impl DataKey {
         self.to_non_zero().get()
     }
 
+    /// Reconstructs a `DataKey` from the value returned by [`DataKey::get`].
+    ///
+    /// Fails if the low half is zero, for the same reason as
+    /// [`DataKey::from_stored_bytes`]: the invariant holds by construction, but a
+    /// value read back from a snapshot is untrusted.
+    pub fn from_key_value(v: u128) -> anyhow::Result<Self> {
+        // Deliberate split into halves; neither cast is lossy.
+        let lo = (v & u128::from(u64::MAX)) as u64;
+        let hi = (v >> 64) as u64;
+        let Some(lo) = NonZeroU64::new(lo) else {
+            return Err(anyhow::anyhow!(
+                "corrupt DataKey: first half must be non-zero"
+            ));
+        };
+        Ok(Self(lo, hi))
+    }
+
     /// Returns the key as a `NonZeroU128`.
     pub fn to_non_zero(self) -> NonZeroU128 {
         NonZeroU128::new(((self.1 as u128) << 64) + (self.0.get() as u128))

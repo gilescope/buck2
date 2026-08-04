@@ -20,6 +20,7 @@ use dice_error::DiceResult;
 use dupe::Dupe;
 use lock_free_hashtable::sharded::ShardedLockFreeRawTable;
 
+use crate::HashSet;
 use crate::arc::Arc;
 use crate::arc::ArcBorrow;
 use crate::epoch::task::dice::DiceTask;
@@ -235,6 +236,31 @@ impl SharedCache {
                 projection_storage: ShardedLockFreeRawTable::new(),
                 is_cancelled: AtomicBool::new(false),
             }),
+        }
+    }
+
+    /// Pressure-eviction support: every key this cache references (pending or
+    /// completed) goes into `referenced` - the cache pins completed values for
+    /// the transaction's lifetime, so evicting them from the graph frees
+    /// nothing. Keys whose task is still pending additionally go into
+    /// `pending` - their dep reads may be imminent.
+    pub(crate) fn collect_referenced_keys(
+        &self,
+        referenced: &mut HashSet<DiceKey>,
+        pending: &mut HashSet<DiceKey>,
+    ) {
+        for task in self.data.storage.iter() {
+            referenced.insert(task.key);
+            let task = DiceTaskRef { internal: task };
+            if task.get_finished_value().is_none() {
+                pending.insert(task.internal.key);
+            }
+        }
+        for task in self.data.projection_storage.iter() {
+            referenced.insert(task.key);
+            if task.is_pending() {
+                pending.insert(task.key);
+            }
         }
     }
 
