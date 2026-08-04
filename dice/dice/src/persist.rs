@@ -32,11 +32,13 @@
 //! decode failure degrades to recompute - corruption can cost time, never
 //! correctness.
 
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use dupe::Dupe;
+use futures::FutureExt;
 use pagable::PagableSerialize;
 use pagable::context::PagableDeserializerImpl;
 use pagable::storage::handle::PagableStorageHandle;
@@ -732,12 +734,32 @@ pub(crate) async fn load_snapshot(
                 // Injected leaves hydrate eagerly: their values are the
                 // baseline the first command's changed_to calls diff against.
                 let erased = erased_keys[i].as_ref().unwrap();
-                let value = match storage
-                    .hydrate(erased, pagable::DataKey::from_key_value(*value_blob)?)
-                    .await
-                {
-                    Ok(v) => v,
+                // Same panic policy as the save side (`store_tagged_blob`): a
+                // value codec may panic rather than error - `NoValueSerialize`
+                // and `TodoValueSerialize` both `unimplemented!()` on
+                // deserialize, and a `PagablePanic` type detonates in the
+                // nested arcs. A leaf we cannot hydrate is a leaf we recompute,
+                // never a failed load.
+                let hydrated = AssertUnwindSafe(
+                    storage.hydrate(erased, pagable::DataKey::from_key_value(*value_blob)?),
+                )
+                .catch_unwind()
+                .await;
+                let value = match hydrated {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            "snapshot: injected `{}` failed to hydrate, recomputing: {e:#}",
+                            erased.key_type_name()
+                        );
+                        stats.dropped_unserializable += 1;
+                        continue;
+                    }
                     Err(_) => {
+                        tracing::debug!(
+                            "snapshot: injected `{}` panicked on hydrate, recomputing",
+                            erased.key_type_name()
+                        );
                         stats.dropped_unserializable += 1;
                         continue;
                     }
