@@ -31,7 +31,7 @@ use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::Weak;
 
 use allocative::Allocative;
@@ -389,7 +389,14 @@ struct FrozenFrozenHeap {
     name: Option<FrozenHeapName>,
     peak_allocated_bytes: Option<usize>,
     #[allocative(skip)]
-    ser_state: OnceLock<Weak<StarlarkSerState>>,
+    /// The serialization state holding a cached reference to this heap, so
+    /// `Drop` can unregister it. `Weak::new()` means unregistered.
+    ///
+    /// Replaceable rather than a `OnceLock`: a heap can outlive the session that
+    /// serialized it - the globals heap outlives every session - and must then
+    /// be registerable with the next one. At most one *live* state at a time
+    /// still holds; see [`FrozenFrozenHeap::register_ser_state`].
+    ser_state: Mutex<Weak<StarlarkSerState>>,
 }
 
 #[derive(Clone, Dupe, Allocative)]
@@ -412,13 +419,23 @@ unsafe impl Sync for FrozenFrozenHeap {}
 unsafe impl Send for FrozenFrozenHeap {}
 
 impl FrozenFrozenHeap {
+    /// Claim this heap for `state`, so the heap's `Drop` unregisters itself from
+    /// that state's resident-heap map.
+    ///
+    /// At most one *live* state may hold a heap - two live states sharing one is
+    /// the genuine ambiguity this rejects, since `Drop` can only notify one of
+    /// them. A claim by a state that has since been dropped is stale and is
+    /// replaced: without that, a heap outliving its first session (the globals
+    /// heap outlives all of them) could never be serialized again.
     fn register_ser_state(&self, state: &Arc<StarlarkSerState>) -> pagable::Result<()> {
-        let state = Arc::downgrade(state);
-        let registered = self.ser_state.get_or_init(|| state.dupe());
-        if Weak::ptr_eq(registered, &state) {
-            Ok(())
-        } else {
-            Err(PagableError::HeapRegisteredWithDifferentSerState.into())
+        let mut registered = self.ser_state.lock().unwrap();
+        match registered.upgrade() {
+            Some(live) if Arc::ptr_eq(&live, state) => Ok(()),
+            Some(_) => Err(PagableError::HeapRegisteredWithDifferentSerState.into()),
+            None => {
+                *registered = Arc::downgrade(state);
+                Ok(())
+            }
         }
     }
 
@@ -624,7 +641,7 @@ impl FrozenFrozenHeap {
             refs,
             name: Some(name),
             peak_allocated_bytes: None,
-            ser_state: OnceLock::new(),
+            ser_state: Mutex::new(Weak::new()),
         });
         let arena_ptr: *const Arena<ChunkAllocator> = &heap.arena;
 
@@ -645,7 +662,10 @@ impl Drop for FrozenFrozenHeap {
         let Some(name) = &self.name else {
             return;
         };
-        let Some(state) = self.ser_state.get().and_then(Weak::upgrade) else {
+        // Collect under the lock, then release it before calling back into the
+        // states, which take locks of their own.
+        let state = self.ser_state.get_mut().ok().and_then(|s| s.upgrade());
+        let Some(state) = state else {
             return;
         };
         state.unregister_heap(
@@ -979,7 +999,7 @@ impl FrozenHeap {
                 refs: refs.into_iter().collect(),
                 name,
                 peak_allocated_bytes,
-                ser_state: OnceLock::new(),
+                ser_state: Mutex::new(Weak::new()),
             });
             register_frozen_heap(&heap);
             FrozenHeapRef(Some(heap))

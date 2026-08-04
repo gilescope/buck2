@@ -18,6 +18,7 @@
 //! Round-trip serialize/deserialize tests for Starlark values.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use allocative::Allocative;
 use derive_more::Display;
@@ -2411,8 +2412,16 @@ starlark::globals_static!(
     }
 );
 
+/// Serializing a module, or the globals themselves, claims the process-wide
+/// globals heap for one `StarlarkSerState` at a time (see
+/// `FrozenFrozenHeap::register_ser_state`), so the tests that do it must not
+/// overlap. Held for the whole body: the claim is released when the state drops.
+/// Poison is ignored - one test panicking should not cascade into the others.
+static GLOBALS_SER_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn test_globals_roundtrip() {
+    let _globals_ser = GLOBALS_SER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use pagable::PagableSerialize;
     let mut globals = GlobalsBuilder::new();
     STATIC_GLOBALS.populate(&mut globals);
@@ -3647,6 +3656,7 @@ fn serialize_module_top_bytes(
 /// Each function targets a different bytecode-arg shape (see inline notes).
 #[test]
 fn test_bcinstrs_def_round_trip_via_module() -> crate::Result<()> {
+    let _globals_ser = GLOBALS_SER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use crate::environment::Module;
     use crate::eval::Evaluator;
     use crate::syntax::AstModule;
@@ -3777,6 +3787,7 @@ def many_locals():
 /// paged-in module hits an unrelated chunk-index gap, orthogonal to `BcInstrs`.
 #[test]
 fn test_bcinstrs_module_serialization_deterministic() -> crate::Result<()> {
+    let _globals_ser = GLOBALS_SER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use crate::environment::FrozenModule;
     use crate::environment::Module;
     use crate::eval::Evaluator;
