@@ -244,7 +244,11 @@ fn spawn_pressure_evictor(dice: std::sync::Weak<Dice>, high: u64, low: u64) {
                         break;
                     }
                 };
-                let _ = buck2_common::memory::purge_jemalloc();
+                // Best-effort: the RSS re-measure below is the real feedback
+                // signal, so a failed purge costs accuracy, not correctness.
+                if let Err(e) = buck2_common::memory::purge_jemalloc() {
+                    tracing::debug!("dice pressure: jemalloc purge failed: {e:#}");
+                }
                 let new_rss = buck2_util::process_stats::process_stats()
                     .rss_bytes
                     .unwrap_or(rss);

@@ -222,40 +222,6 @@ fn format_dup_strings_summary(stats: &starlark::values::DupStringStats) -> Strin
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use starlark::values::DupStringStat;
-    use starlark::values::DupStringStats;
-
-    use super::format_dup_strings_summary;
-
-    #[test]
-    fn dup_strings_summary_renders_totals_and_top_table() {
-        let stats = DupStringStats {
-            heaps: 3,
-            total_strings: 5,
-            total_bytes: 73,
-            distinct_strings: 3,
-            distinct_bytes: 37,
-            top: vec![DupStringStat {
-                sample: "shared-flag-string".to_owned(),
-                len: 18,
-                copies: 3,
-            }],
-        };
-        let s = format_dup_strings_summary(&stats);
-        assert!(s.contains("3 heaps, 5 strings, 73 payload bytes"));
-        assert!(s.contains("duplicated: 2 copies, 36 bytes (49.3%"));
-        assert!(s.contains("\"shared-flag-string\""));
-    }
-
-    #[test]
-    fn dup_strings_summary_empty_is_divide_by_zero_safe() {
-        let s = format_dup_strings_summary(&DupStringStats::default());
-        assert!(s.contains("(0.0%"));
-    }
-}
-
 fn format_status_summary(status: &PagableStatus, page_out_in_progress: bool) -> String {
     // `total_nodes` counts vacant/in-progress nodes too; the rest is "other".
     // saturating_sub guards an underflow the struct invariant already rules out.
@@ -289,4 +255,38 @@ fn format_status_summary(status: &PagableStatus, page_out_in_progress: bool) -> 
         }
     }
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use starlark::values::DupStringStat;
+    use starlark::values::DupStringStats;
+
+    use super::format_dup_strings_summary;
+
+    #[test]
+    fn dup_strings_summary_renders_totals_and_top_table() {
+        let stats = DupStringStats {
+            heaps: 3,
+            total_strings: 5,
+            total_bytes: 73,
+            distinct_strings: 3,
+            distinct_bytes: 37,
+            top: vec![DupStringStat {
+                sample: "shared-flag-string".to_owned(),
+                len: 18,
+                copies: 3,
+            }],
+        };
+        let s = format_dup_strings_summary(&stats);
+        assert!(s.contains("3 heaps, 5 strings, 73 payload bytes"));
+        assert!(s.contains("duplicated: 2 copies, 36 bytes (49.3%"));
+        assert!(s.contains("\"shared-flag-string\""));
+    }
+
+    #[test]
+    fn dup_strings_summary_empty_is_divide_by_zero_safe() {
+        let s = format_dup_strings_summary(&DupStringStats::default());
+        assert!(s.contains("(0.0%"));
+    }
 }
